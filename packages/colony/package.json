@@ -1,5 +1,5 @@
 {
-  "name": "@ant/colony",
+  "name": "@antjs.org/colony",
   "version": "0.0.3",
   "description": "Deploy Ant apps to ants.page (console.antjs.org)",
   "repository": {
