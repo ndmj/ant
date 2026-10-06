@@ -8,15 +8,12 @@ export function consoleUrl(): string {
 
 export interface BindingDef {
   kind: 'kv' | 'sql';
-  binding: string;
-  id: string;
-  name?: string;
+  binding: string; // env.<binding> in the app
+  name: string; // the store, owned by you; projects binding the same name share it
   migrationsDir?: string;
 }
 
 export interface AssetsDef {
-  binding: string;
-  name?: string;
   directory: string;
   notFound: 'single-page-application' | 'none';
   startAnt: boolean | string[];
@@ -25,7 +22,6 @@ export interface AssetsDef {
 export interface ColonyConfig {
   name: string;
   main: string;
-  placement: string;
   observability: boolean;
   vars: Record<string, string>;
   bindings: BindingDef[];
@@ -69,12 +65,14 @@ function bindings(value: unknown, kind: BindingDef['kind']): BindingDef[] {
   return value.map((entry, index) => {
     const prefix = `${kind}[${index}]`;
     const item = table(entry, prefix);
+    const name = string(item.binding, `${prefix}.binding`);
     const binding: BindingDef = {
       kind,
-      binding: string(item.binding, `${prefix}.binding`),
-      id: string(item.id, `${prefix}.id`),
-      name: optionalString(item.name, `${prefix}.name`)
+      binding: name,
+      name: string(item.name, `${prefix}.name`, name.toLowerCase())
     };
+    if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(binding.name))
+      throw new Error(`\`${prefix}.name\` must be lowercase letters, numbers, \`-\` or \`_\`.`);
     if (kind === 'sql') binding.migrationsDir = optionalString(item.migrations_dir, `${prefix}.migrations_dir`);
     return binding;
   });
@@ -120,8 +118,6 @@ export function loadColonyToml(dir = process.cwd()): ColonyConfig {
     if (notFound !== 'none' && notFound !== 'single-page-application')
       throw new Error('`assets.not_found_handling` must be `none` or `single-page-application`.');
     assets = {
-      binding: string(a.binding, 'assets.binding', 'ASSETS'),
-      name: optionalString(a.name, 'assets.name'),
       directory: string(a.directory, 'assets.directory', './dist'),
       notFound,
       startAnt: startAnt(a.start_ant)
@@ -135,7 +131,6 @@ export function loadColonyToml(dir = process.cwd()): ColonyConfig {
   return {
     name: normalizeProjectName(string(doc.name, 'name')),
     main: string(doc.main ?? doc.entry, 'main', 'server.js'),
-    placement: string(doc.placement, 'placement', 'default'),
     observability: observability.enabled === true,
     vars,
     bindings: allBindings,

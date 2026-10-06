@@ -3,7 +3,7 @@ import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { loadColonyToml, findColonyToml, normalizeProjectName } from './config';
 import { bundle, collectAssets, collectMigrations, type Asset, type Migration } from './build';
-import { getProject, deployManifest, deleteProject, listProjects } from './api';
+import { getProject, deployManifest, deleteProject, listProjects, missingAssets, uploadAsset } from './api';
 import { sha256hex, styleText } from './utils';
 
 function ensureDeps(): void {
@@ -51,26 +51,45 @@ export async function deploy(): Promise<void> {
   }
   console.log(styleText('dim', `  bundle ${bytes.byteLength} bytes · sha256 ${hash.slice(0, 12)}`));
 
-  if (!(await getProject(cfg.name)))
-    console.log(`Creating project ${styleText('cyan', cfg.name)} ${styleText('dim', `(placement=${cfg.placement})`)}…`);
-  for (const b of cfg.bindings) console.log(styleText('dim', `  bind env.${b.binding} -> ${b.kind} ${b.id}`));
+  if (!(await getProject(cfg.name))) console.log(`Creating project ${styleText('cyan', cfg.name)}…`);
+  for (const b of cfg.bindings) console.log(styleText('dim', `  bind env.${b.binding} -> ${b.kind} ${b.name}`));
+
+  if (assets.length) await uploadAssets(assets);
 
   const r = await deployManifest(cfg.name, {
-    hash,
     script,
-    placement: cfg.placement,
     observability: cfg.observability,
     vars: cfg.vars,
-    bindings: cfg.bindings.map(b => ({ kind: b.kind, name: b.binding, id: b.id, resourceName: b.name })),
+    bindings: cfg.bindings.map(b => ({ kind: b.kind, binding: b.binding, name: b.name })),
     migrations,
-    assets,
-    assetsConfig: cfg.assets
-      ? { notFound: cfg.assets.notFound, startAnt: cfg.assets.startAnt, binding: cfg.assets.binding, name: cfg.assets.name }
-      : null
+    assets: assets.map(a => ({ path: a.path, ct: a.ct, hash: a.hash })),
+    assetsConfig: cfg.assets ? { notFound: cfg.assets.notFound, startAnt: cfg.assets.startAnt } : null
   });
   console.log();
   console.log(`${styleText('green', 'Deployed')} ${styleText('cyan', r.url)}`);
   console.log(styleText('dim', `  preview ${r.previewUrl}  ·  ${r.deployment.id}`));
+}
+
+// Uploads the assets the server doesn't have yet, a few at a time.
+async function uploadAssets(assets: Asset[]): Promise<void> {
+  const byHash = new Map(assets.map(a => [a.hash, a]));
+  const missing = await missingAssets([...byHash.keys()]);
+  if (!missing.length) {
+    console.log(styleText('dim', `  assets unchanged, nothing to upload`));
+    return;
+  }
+  let sent = 0;
+  const raw = missing.reduce((n, h) => n + byHash.get(h)!.size, 0);
+  const queue = [...missing];
+  const worker = async () => {
+    for (let h = queue.shift(); h; h = queue.shift()) {
+      const n = await uploadAsset(h, readFileSync(byHash.get(h)!.file)); // not `sent += await`: that reads sent before the await
+      sent += n;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, queue.length) }, worker));
+  const kb = (n: number) => `${(n / 1024).toFixed(1)} KB`;
+  console.log(styleText('dim', `  uploaded ${missing.length} of ${byHash.size} asset(s): ${kb(raw)} (${kb(sent)} sent)`));
 }
 
 export async function destroy(name?: string): Promise<void> {
@@ -87,8 +106,7 @@ export async function list(): Promise<void> {
     return;
   }
   for (const p of projects) {
-    const active = p.active_deployment ?? styleText('dim', '(no deployment)');
-    console.log(`  ${styleText('cyan', p.name.padEnd(22))} ${p.placement.padEnd(8)} ${active}`);
+    console.log(`  ${styleText('cyan', p.name.padEnd(22))} ${p.active ?? styleText('dim', '(no deployment)')}`);
   }
 }
 
@@ -100,7 +118,6 @@ export function init(name?: string): void {
     p,
     `name = ${JSON.stringify(projName)}
 main = "server.js"
-placement = "default"
 
 [observability]
 enabled = false
@@ -108,14 +125,16 @@ enabled = false
 # [vars]
 # GREETING = "hello"
 
-# Bindings reference a resource by a stable id; env.<binding> is just an alias.
+# Bindings expose a store as env.<binding>. Stores are yours and named by
+# \`name\` (default: the binding, lowercased); they're created on first deploy,
+# and projects that bind the same name share the store.
 # [[kv]]
 # binding = "CACHE"
-# id = "kv_change_me"
+# name = "cache"
 
 # [[sql]]
 # binding = "DB"
-# id = "sql_change_me"
+# name = "app-db"
 # migrations_dir = "schema"
 
 # A worker WITH [assets] serves static files; start_ant routes requests to your

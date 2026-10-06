@@ -19,7 +19,6 @@ test('loads a complete colony.toml', () => {
   withConfig(
     `name = "Example"
 main = "src/server.js"
-placement = "smart"
 
 [observability]
 enabled = true
@@ -30,11 +29,10 @@ RETRIES = 3
 
 [[kv]]
 binding = "CACHE"
-id = "kv_1"
 
 [[sql]]
 binding = "DB"
-id = "sql_1"
+name = "app-db"
 migrations_dir = "schema"
 
 [assets]
@@ -46,16 +44,13 @@ start_ant = ["/api/*", "/admin/*"]
       assert.deepEqual(loadColonyToml(dir), {
         name: 'example',
         main: 'src/server.js',
-        placement: 'smart',
         observability: true,
         vars: { MESSAGE: 'hello # colony', RETRIES: '3' },
         bindings: [
-          { kind: 'kv', binding: 'CACHE', id: 'kv_1', name: undefined },
-          { kind: 'sql', binding: 'DB', id: 'sql_1', name: undefined, migrationsDir: 'schema' }
+          { kind: 'kv', binding: 'CACHE', name: 'cache' },
+          { kind: 'sql', binding: 'DB', name: 'app-db', migrationsDir: 'schema' }
         ],
         assets: {
-          binding: 'ASSETS',
-          name: undefined,
           directory: 'public',
           notFound: 'single-page-application',
           startAnt: ['/api/*', '/admin/*']
@@ -70,12 +65,21 @@ test('rejects duplicate bindings', () => {
     `name = "example"
 [[kv]]
 binding = "DATA"
-id = "kv_1"
 [[sql]]
 binding = "DATA"
-id = "sql_1"
 `,
     dir => assert.throws(() => loadColonyToml(dir), /duplicate binding: DATA/)
+  );
+});
+
+test('rejects store names with uppercase or spaces', () => {
+  withConfig(
+    `name = "example"
+[[kv]]
+binding = "CACHE"
+name = "My Cache"
+`,
+    dir => assert.throws(() => loadColonyToml(dir), /kv\[0\]\.name/)
   );
 });
 

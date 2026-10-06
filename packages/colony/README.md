@@ -7,7 +7,7 @@ project described by `colony.toml`.
 
 Colony can deploy script-only applications or applications with static assets.
 Deployments may also include environment variables, KV and SQL bindings, SQL
-migrations, placement settings, and observability configuration.
+migrations, and observability configuration.
 
 ## Quick start
 
@@ -35,7 +35,6 @@ A complete `colony.toml` can look like this:
 ```toml
 name = "my-app"
 main = "server.js"
-placement = "default"
 
 [observability]
 enabled = true
@@ -45,11 +44,11 @@ GREETING = "hello"
 
 [[kv]]
 binding = "CACHE"
-id = "kv_example"
+name = "cache"
 
 [[sql]]
 binding = "DB"
-id = "sql_example"
+name = "app-db"
 migrations_dir = "schema"
 
 [assets]
@@ -64,7 +63,6 @@ The main settings are:
 | --------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `name`                      | Project name and the `<name>.ants.page` hostname. Required.                                                  |
 | `main`                      | Application entrypoint. Defaults to `server.js`.                                                             |
-| `placement`                 | Deployment placement. Defaults to `default`.                                                                 |
 | `observability.enabled`     | Enables observability for the deployment.                                                                    |
 | `vars`                      | String values exposed to the application as environment variables.                                           |
 | `kv`                        | KV resources exposed as `env.<binding>`.                                                                     |
@@ -74,9 +72,11 @@ The main settings are:
 | `assets.not_found_handling` | Set to `single-page-application` for SPA fallback behavior.                                                  |
 | `assets.start_ant`          | Routes requests to the Ant application. Use `true` for all requests or a list of globs such as `["/api/*"]`. |
 
-KV and SQL resources are referenced by stable IDs. An optional `name` can be
-provided on a binding as resource metadata. The assets binding defaults to
-`ASSETS` and can be changed with `assets.binding`.
+A binding exposes one of your stores to the application as `env.<binding>`.
+Stores are named with `name` (defaulting to the binding in lowercase), belong
+to your account, and are created on the first deploy that uses them. Projects
+that bind the same `name` share the store. Names use lowercase letters,
+numbers, `-` and `_`.
 
 Filesystem and subprocess modules (`fs`, `fs/promises`, and `child_process`)
 are not available on ants.page and are rejected while bundling.
