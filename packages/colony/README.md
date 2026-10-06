@@ -82,6 +82,23 @@ to your account, and are created on the first deploy that uses them. Projects
 that bind the same `name` share the store. Names use lowercase letters,
 numbers, `-` and `_`.
 
+## Static sites
+
+A project with `[assets]` and no script (no `main`, and no `server.js` next to
+`colony.toml`) deploys as a static site, like Cloudflare Pages: the files are
+served straight from the edge node and no code runs, so there are no cold
+starts. `/about` serves `about.html`, `/blog/` serves `blog/index.html`, and a
+`404.html` (if you have one) is the not-found page; with
+`not_found_handling = "single-page-application"`, unknown paths get
+`index.html` instead.
+
+```toml
+name = "my-site"
+
+[assets]
+directory = "./dist"
+```
+
 Files is one store per account, shared by every project that binds it, with
 an R2-style API: `put(key, body, { httpMetadata: { contentType } })`,
 `get(key)` (with `.text()`, `.json()`, `.arrayBuffer()`, `.body`; `null` if

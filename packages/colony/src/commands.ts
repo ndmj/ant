@@ -29,12 +29,18 @@ function ensureDeps(): void {
 
 export async function deploy(): Promise<void> {
   const cfg = loadColonyToml();
-  ensureDeps();
-
-  console.log(`Building ${styleText('cyan', cfg.name)} ${styleText('dim', `(${cfg.main})`)}…`);
-  const bytes = await bundle(cfg.main);
-  const script = new TextDecoder().decode(bytes);
-  const hash = sha256hex(bytes);
+  let script = '';
+  let built = '';
+  if (cfg.main === null) {
+    console.log(`Deploying ${styleText('cyan', cfg.name)} ${styleText('dim', '(static site: files only, no script)')}…`);
+    if (cfg.bindings.length) console.log(styleText('yellow', '  bindings are ignored: a static site runs no code'));
+  } else {
+    ensureDeps();
+    console.log(`Building ${styleText('cyan', cfg.name)} ${styleText('dim', `(${cfg.main})`)}…`);
+    const bytes = await bundle(cfg.main);
+    script = new TextDecoder().decode(bytes);
+    built = `  bundle ${bytes.byteLength} bytes · sha256 ${sha256hex(bytes).slice(0, 12)}`;
+  }
 
   const migrations: Record<string, Migration[]> = {};
   for (const b of cfg.bindings) {
@@ -49,7 +55,7 @@ export async function deploy(): Promise<void> {
     assets = collectAssets(cfg.assets.directory);
     console.log(styleText('dim', `  ${assets.length} asset(s) from ${cfg.assets.directory}`));
   }
-  console.log(styleText('dim', `  bundle ${bytes.byteLength} bytes · sha256 ${hash.slice(0, 12)}`));
+  if (built) console.log(styleText('dim', built));
 
   if (!(await getProject(cfg.name))) console.log(`Creating project ${styleText('cyan', cfg.name)}…`);
   for (const b of cfg.bindings) console.log(styleText('dim', `  bind env.${b.binding} -> ${b.kind} ${b.name}`));
@@ -60,7 +66,7 @@ export async function deploy(): Promise<void> {
     script,
     observability: cfg.observability,
     vars: cfg.vars,
-    bindings: cfg.bindings.map(b => ({ kind: b.kind, binding: b.binding, name: b.name })),
+    bindings: cfg.main === null ? [] : cfg.bindings.map(b => ({ kind: b.kind, binding: b.binding, name: b.name })),
     migrations,
     assets: assets.map(a => ({ path: a.path, ct: a.ct, hash: a.hash })),
     assetsConfig: cfg.assets ? { notFound: cfg.assets.notFound, startAnt: cfg.assets.startAnt } : null

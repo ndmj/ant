@@ -110,3 +110,21 @@ test('files bindings take no name and always mean the account store', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('assets with no main and no server.js is a static site', () => {
+  const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
+  const { tmpdir } = require('node:os');
+  const { join } = require('node:path');
+  const { loadColonyToml } = require('../dist/config');
+  const dir = mkdtempSync(join(tmpdir(), 'colony-static-'));
+  try {
+    writeFileSync(join(dir, 'colony.toml'), 'name = "site"\n[assets]\ndirectory = "./dist"\n');
+    assert.equal(loadColonyToml(dir).main, null);
+    writeFileSync(join(dir, 'server.js'), 'export default {}');
+    assert.equal(loadColonyToml(dir).main, 'server.js');
+    writeFileSync(join(dir, 'colony.toml'), 'name = "app"\n');
+    assert.equal(loadColonyToml(dir).main, 'server.js');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

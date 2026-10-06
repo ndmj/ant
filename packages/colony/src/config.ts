@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { parse } from 'smol-toml';
 
 export function consoleUrl(): string {
@@ -21,7 +21,7 @@ export interface AssetsDef {
 
 export interface ColonyConfig {
   name: string;
-  main: string;
+  main: string | null; // null: a static site (assets only, no script)
   observability: boolean;
   vars: Record<string, string>;
   bindings: BindingDef[];
@@ -133,9 +133,13 @@ export function loadColonyToml(dir = process.cwd()): ColonyConfig {
   if (observability.enabled !== undefined && typeof observability.enabled !== 'boolean')
     throw new Error('`observability.enabled` must be a boolean.');
 
+  // No `main` and no server.js, but [assets]: a static site, served without ant.
+  const explicit = doc.main ?? doc.entry;
+  const main = explicit !== undefined ? string(explicit, 'main') : assets && !existsSync(join(dirname(p), 'server.js')) ? null : 'server.js';
+
   return {
     name: normalizeProjectName(string(doc.name, 'name')),
-    main: string(doc.main ?? doc.entry, 'main', 'server.js'),
+    main,
     observability: observability.enabled === true,
     vars,
     bindings: allBindings,
