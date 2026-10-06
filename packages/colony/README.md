@@ -51,6 +51,9 @@ binding = "DB"
 name = "app-db"
 migrations_dir = "schema"
 
+[[files]]
+binding = "FILES"
+
 [assets]
 directory = "./dist"
 not_found_handling = "single-page-application"
@@ -68,6 +71,7 @@ The main settings are:
 | `kv`                        | KV resources exposed as `env.<binding>`.                                                                     |
 | `sql`                       | SQL resources exposed as `env.<binding>`.                                                                    |
 | `sql.migrations_dir`        | Directory of `.sql` migrations, applied in filename order.                                                   |
+| `files`                     | Your account's Files (object storage, 256 MB) exposed as `env.<binding>`. Takes no `name`.                   |
 | `assets.directory`          | Directory of static files to upload. Defaults to `./dist`.                                                   |
 | `assets.not_found_handling` | Set to `single-page-application` for SPA fallback behavior.                                                  |
 | `assets.start_ant`          | Routes requests to the Ant application. Use `true` for all requests or a list of globs such as `["/api/*"]`. |
@@ -77,6 +81,13 @@ Stores are named with `name` (defaulting to the binding in lowercase), belong
 to your account, and are created on the first deploy that uses them. Projects
 that bind the same `name` share the store. Names use lowercase letters,
 numbers, `-` and `_`.
+
+Files is one store per account, shared by every project that binds it, with
+an R2-style API: `put(key, body, { httpMetadata: { contentType } })`,
+`get(key)` (with `.text()`, `.json()`, `.arrayBuffer()`, `.body`; `null` if
+absent; `{ range: { offset, length } }` for part of a file), `head(key)`,
+`list({ prefix, delimiter, cursor, limit })` and `delete(key | keys)`. You can
+browse, upload and download them in the console under Storage → Files.
 
 Filesystem and subprocess modules (`fs`, `fs/promises`, and `child_process`)
 are not available on ants.page and are rejected while bundling.

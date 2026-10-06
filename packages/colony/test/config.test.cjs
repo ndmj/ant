@@ -94,3 +94,19 @@ test('reports malformed TOML with the config path', () => {
     assert.throws(() => loadColonyToml(dir), new RegExp(`could not parse ${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   });
 });
+
+test('files bindings take no name and always mean the account store', () => {
+  const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
+  const { tmpdir } = require('node:os');
+  const { join } = require('node:path');
+  const { loadColonyToml } = require('../dist/config');
+  const dir = mkdtempSync(join(tmpdir(), 'colony-files-'));
+  try {
+    writeFileSync(join(dir, 'colony.toml'), 'name = "app"\n[[files]]\nbinding = "FILES"\n');
+    assert.deepEqual(loadColonyToml(dir).bindings, [{ kind: 'files', binding: 'FILES', name: 'files' }]);
+    writeFileSync(join(dir, 'colony.toml'), 'name = "app"\n[[files]]\nbinding = "FILES"\nname = "mine"\n');
+    assert.throws(() => loadColonyToml(dir), /takes no name/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

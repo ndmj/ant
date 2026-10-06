@@ -7,9 +7,9 @@ export function consoleUrl(): string {
 }
 
 export interface BindingDef {
-  kind: 'kv' | 'sql';
+  kind: 'kv' | 'sql' | 'files';
   binding: string; // env.<binding> in the app
-  name: string; // the store, owned by you; projects binding the same name share it
+  name: string; // the store, owned by you; projects binding the same name share it (files: always your account's one store)
   migrationsDir?: string;
 }
 
@@ -66,6 +66,11 @@ function bindings(value: unknown, kind: BindingDef['kind']): BindingDef[] {
     const prefix = `${kind}[${index}]`;
     const item = table(entry, prefix);
     const name = string(item.binding, `${prefix}.binding`);
+    if (kind === 'files') {
+      // One Files store per account, shared by all your projects: no name.
+      if (item.name !== undefined) throw new Error(`\`${prefix}.name\`: Files is one store per account, so it takes no name.`);
+      return { kind, binding: name, name: 'files' };
+    }
     const binding: BindingDef = {
       kind,
       binding: name,
@@ -104,7 +109,7 @@ export function loadColonyToml(dir = process.cwd()): ColonyConfig {
     vars[key] = String(value);
   }
 
-  const allBindings = [...bindings(doc.kv, 'kv'), ...bindings(doc.sql, 'sql')];
+  const allBindings = [...bindings(doc.kv, 'kv'), ...bindings(doc.sql, 'sql'), ...bindings(doc.files, 'files')];
   const names = new Set<string>();
   for (const binding of allBindings) {
     if (names.has(binding.binding)) throw new Error(`duplicate binding: ${binding.binding}`);

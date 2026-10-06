@@ -137,6 +137,11 @@ enabled = false
 # name = "app-db"
 # migrations_dir = "schema"
 
+# Files: your account's object storage (256 MB), shared by all your projects.
+# env.FILES.put(key, body) / get(key) / head(key) / list({ prefix }) / delete(key)
+# [[files]]
+# binding = "FILES"
+
 # A worker WITH [assets] serves static files; start_ant routes requests to your
 # code (true = all, or a glob list like ["/api/*"]). Without it, it's script-only.
 # [assets]
