@@ -106,9 +106,6 @@ absent; `{ range: { offset, length } }` for part of a file), `head(key)`,
 `list({ prefix, delimiter, cursor, limit })` and `delete(key | keys)`. You can
 browse, upload and download them in the console under Storage → Files.
 
-Filesystem and subprocess modules (`fs`, `fs/promises`, and `child_process`)
-are not available on ants.page and are rejected while bundling.
-
 ## Commands
 
 | Command                | Description                                                                                |

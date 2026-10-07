@@ -3,21 +3,10 @@ import { extname, join } from 'node:path';
 import { rolldown, type Plugin } from 'rolldown';
 import { sha256hex } from './utils';
 
-const FORBIDDEN = new Set(['fs', 'fs/promises', 'child_process']);
-const strip = (spec: string): string => spec.replace(/^node:/, '').replace(/^ant:/, '');
-
-const denied = (spec: string): never => {
-  throw new Error(`"${spec}" is not allowed on ants.page — filesystem and subprocess access are blocked.`);
-};
-
 const antPlugin: Plugin = {
   name: 'ant-platform',
   resolveId(source) {
-    if (/^(node:|ant:)/.test(source)) {
-      if (FORBIDDEN.has(strip(source))) denied(source);
-      return { id: source, external: true };
-    }
-    if (FORBIDDEN.has(source)) denied(source);
+    if (/^(node:|ant:)/.test(source)) return { id: source, external: true };
     return null;
   }
 };
