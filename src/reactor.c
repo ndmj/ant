@@ -31,6 +31,7 @@ static inline bool event_loop_alive(ant_t *js) {
 void js_poll_events(ant_t *js) {
   gc_maybe(js);
 
+  process_microtasks(js);
   process_immediates(js);
   process_microtasks(js);
 }
@@ -67,7 +68,7 @@ drain:
     js_poll_events(js);
     work_flags_t work = get_pending_work(js);
   
-    if (work & WORK_BLOCKING) 
+    if ((work & WORK_BLOCKING) || has_active_immediates(js))
       ant_uv_run(uv_default_loop(), UV_RUN_NOWAIT);
     else if ((work & WORK_ASYNC) || uv_loop_alive(uv_default_loop())) {
       if (!reactor_idle_gc(js)) ant_uv_run(uv_default_loop(), UV_RUN_ONCE);
@@ -77,9 +78,10 @@ drain:
   }
   
   process_report_uncaught_exception_if_pending(js);
-  js_poll_events(js);
-  ant_value_t code = js_mknum(0);
+  if (has_pending_immediates(js)) process_immediates(js);
+  process_microtasks(js);
   
+  ant_value_t code = js_mknum(process_exit_code(js));
   emit_process_event(js, "beforeExit", &code, 1);
   if (event_loop_alive(js)) goto drain;
 }

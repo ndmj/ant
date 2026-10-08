@@ -51,6 +51,7 @@ void jit_load_externals_once(sv_jit_ctx_t *jc) {
   LOAD_EXT(jit_helper_gt);
   LOAD_EXT(jit_helper_ge);
   LOAD_EXT(jit_helper_call);
+  LOAD_EXT(jit_helper_native_finish);
   LOAD_EXT(jit_helper_call_method);
   LOAD_EXT(jit_helper_call_array_includes);
   LOAD_EXT(jit_helper_call_char_code_at);
@@ -89,6 +90,19 @@ void jit_load_externals_once(sv_jit_ctx_t *jc) {
   LOAD_EXT(jit_helper_promote_due);
   LOAD_EXT(jit_helper_close_upval);
   LOAD_EXT(jit_helper_upval_barrier);
+  LOAD_EXT(jit_helper_upval_flagged);
+  LOAD_EXT(jit_helper_elem_barrier);
+  LOAD_EXT(jit_helper_disable_param_counters);
+  LOAD_EXT(jit_helper_number_to_string);
+  LOAD_EXT(ant_math_ceil);
+  LOAD_EXT(ant_math_floor);
+  LOAD_EXT(ant_math_round);
+  LOAD_EXT(ant_math_sign);
+  LOAD_EXT(ant_math_sqrt);
+  LOAD_EXT(ant_math_trunc);
+  LOAD_EXT(ant_math_imul);
+  LOAD_EXT(ant_math_max);
+  LOAD_EXT(ant_math_min);
   LOAD_EXT(jit_helper_adopt_open_upvalues);
   LOAD_EXT(jit_helper_take_open_upvalues);
   LOAD_EXT(jit_helper_take_open_upvalues_rebase);
@@ -283,6 +297,12 @@ ant_value_t sv_jit_try_osr(
     osr_closure_value = mkref(kTypeFunction, closure);
     closure->func = func;
     closure->upvalues = frame->upvalues;
+    
+    if (frame->upvalues && func->upvalue_count <= SV_CLOSURE_INLINE_UPVALS) {
+      memcpy(closure->inline_upvals, frame->upvalues, sizeof(sv_upvalue_t *) * (size_t)func->upvalue_count);
+      closure->upvalues = closure->inline_upvals;
+    }
+    
     closure->call_flags = SV_CALL_BORROWED_UPVALS;
     closure->js = js;
     closure->bound_this = js_mkundef();

@@ -57,6 +57,14 @@ typedef enum {
 } sv_op_t;
 
 typedef enum {
+  SV_SPECIAL_ARGUMENTS     = 0,
+  SV_SPECIAL_NEW_TARGET    = 1,
+  SV_SPECIAL_SUPER         = 2,
+  SV_SPECIAL_MODULE_IMPORT = 3,
+  SV_SPECIAL_ARGC          = 4,
+} sv_special_obj_t;
+
+typedef enum {
   SV_STABLE_BUILTIN_PROMISE_RESOLVE = 0,
 } sv_stable_builtin_t;
 
@@ -567,6 +575,9 @@ struct sv_func {
   bool jit_inline_reuse_empty: 1;
   bool fb_unit_watched: 1;
   bool fb_unit_target: 1;
+  
+  uint8_t jit_param_counters_off;
+  uint8_t jit_snapshot_resets;
 
   sv_code_unit_t *unit;
   struct sv_func *unit_next;
@@ -718,7 +729,20 @@ struct sv_upvalue {
   struct sv_upvalue *next;
   uint64_t gc_epoch;
   uint8_t in_remember_set;
+  uint8_t maps_arguments;
+  uint8_t args_index;
+  uint32_t args_owner;
 };
+
+static_assert(
+  sizeof(struct sv_upvalue) == 40, 
+  "arguments link fields must stay in the upvalue padding"
+);
+
+static_assert(
+  offsetof(struct sv_upvalue, maps_arguments) == offsetof(struct sv_upvalue, in_remember_set) + 1,
+  "upvalue flag bytes are read together as one u16"
+);
 
 typedef struct sv_activation {
   int frame_count;
@@ -745,6 +769,25 @@ static inline void gc_upvalue_write_barrier(ant_t *js, sv_upvalue_t *uv, ant_val
   if (!is_tagged(new_val) || !gc_value_is_heap_ref(new_val)) return;
   if (uv->location == &uv->closed || gc_value_ref_is_young(new_val))
     gc_remember_upvalue(js, uv);
+}
+
+void js_arguments_upvalue_written(ant_t *js, sv_upvalue_t *uv, ant_value_t value);
+void js_arguments_link_upvalue(ant_t *js, sv_frame_t *frame, sv_upvalue_t *uv);
+
+static inline uint16_t sv_upvalue_flags(const sv_upvalue_t *uv) {
+  uint16_t flags;
+  __builtin_memcpy(&flags, &uv->in_remember_set, sizeof(flags));
+  return flags;
+}
+
+static inline void sv_upvalue_store(ant_t *js, sv_upvalue_t *uv, ant_value_t val) {
+  *uv->location = val;
+  uint16_t flags = sv_upvalue_flags(uv);
+  if (__builtin_expect(flags == 0, 1)) gc_upvalue_write_barrier(js, uv, val);
+  else if (flags != 1) {
+    gc_upvalue_write_barrier(js, uv, val);
+    js_arguments_upvalue_written(js, uv, val);
+  }
 }
 
 static inline void gc_upvalue_capture_barrier(ant_t *js, sv_upvalue_t *uv) {

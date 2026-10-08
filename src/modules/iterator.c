@@ -76,7 +76,9 @@ static inline ant_value_t iter_get_element(ant_t *js, ant_value_t obj, uint32_t 
 static inline ant_offset_t iter_get_length(ant_t *js, ant_value_t obj) {
   if (vtype(obj) == kTypeArray) return js_arr_len(js, obj);
   ant_value_t v = js_get(js, obj, "length");
-  return (vtype(v) == kTypeNumber) ? (ant_offset_t)js_getnum(v) : 0;
+  double len = vtype(v) == kTypeNumber ? js_getnum(v) : js_to_number(js, v);
+  if (!(len > 0)) return 0;
+  return len > 9007199254740991.0 ? (ant_offset_t)9007199254740991.0 : (ant_offset_t)len;
 }
 
 static bool advance_array(ant_t *js, iterator_t *it, ant_value_t *out) {
@@ -163,7 +165,10 @@ static ant_value_t get_array_iterator_prototype(ant_t *js) {
   ant_value_t iterator_proto = get_iterator_prototype(js);
   js->sym.array_iterator_proto = js_mkobj(js);
   
-  defmethod(js, js->sym.array_iterator_proto, "next", 4, js_mkfun(arr_iter_next));
+  bool iteration_patched = js->array_iteration_protector_invalid;
+  js->sym.array_iterator_next = defmethod(js, js->sym.array_iterator_proto, "next", 4, js_mkfun(arr_iter_next));
+  js->array_iteration_protector_invalid = iteration_patched;
+  
   mkprop(js, js->sym.array_iterator_proto, js->sym.toStringTag_sym, ANT_STRING("Array Iterator"), ANT_PROP_ATTR_CONFIGURABLE);
   js_set_proto_init(js->sym.array_iterator_proto, iterator_proto);
 

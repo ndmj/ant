@@ -453,10 +453,7 @@ static inline void sv_with_fallback_put(
     case WITH_FB_UPVAL:
       if (frame->upvalues && (int)idx < frame->upvalue_count) {
         sv_upvalue_t *uv = frame->upvalues[idx];
-        if (uv) {
-          *uv->location = val;
-          gc_upvalue_write_barrier(js, uv, val);
-        }
+        if (uv) sv_upvalue_store(js, uv, val);
       }
       break;
     default: break;
@@ -689,27 +686,31 @@ static inline void sv_op_special_obj(
   sv_vm_t *vm, ant_t *js,
   sv_frame_t *frame, uint8_t *ip
 ) {
-  uint8_t which = sv_get_u8(ip + 1);
-  if (which == 3) {
-    vm->stack[vm->sp++] = js_get_module_import_binding(js);
-    return;
-  }
-  if (which == 1) {
-    vm->stack[vm->sp++] = frame ? frame->new_target : js_mkundef();
-    return;
-  }
-  if (which == 2) {
-    vm->stack[vm->sp++] = frame ? frame->super_val : js_mkundef();
-    return;
-  }
-  if (which != 0 || !frame) {
-    vm->stack[vm->sp++] = js_mkundef();
-    return;
+  switch ((sv_special_obj_t)sv_get_u8(ip + 1)) {
+    case SV_SPECIAL_MODULE_IMPORT:
+      vm->stack[vm->sp++] = js_get_module_import_binding(js);
+      return;
+    case SV_SPECIAL_NEW_TARGET:
+      vm->stack[vm->sp++] = frame ? frame->new_target : js_mkundef();
+      return;
+    case SV_SPECIAL_SUPER:
+      vm->stack[vm->sp++] = frame ? frame->super_val : js_mkundef();
+      return;
+    case SV_SPECIAL_ARGC:
+      vm->stack[vm->sp++] = js_mknum(frame ? (double)frame->argc : 0);
+      return;
+    case SV_SPECIAL_ARGUMENTS:
+      if (frame) break;
+      [[fallthrough]];
+    default:
+      vm->stack[vm->sp++] = js_mkundef();
+      return;
   }
 
   if (vtype(frame->arguments_obj) == kTypeUndefined) {
     int mapped_count = sv_frame_is_strict(frame) || !frame->func ? 0 : frame->func->param_count;
     if (mapped_count > frame->argc) mapped_count = frame->argc;
+    
     frame->arguments_obj = js_create_arguments_object(
       js, vm, frame->callee, frame, frame->argc,
       mapped_count, sv_frame_is_strict(frame)

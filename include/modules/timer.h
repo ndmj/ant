@@ -18,6 +18,8 @@ typedef struct {
   struct microtask_entry *microtasks_processing;
   struct immediate_entry *immediates;
   struct immediate_entry *immediates_tail;
+  struct immediate_entry *immediates_processing;
+  
   int next_timer_id;
   int next_immediate_id;
   int active_timer_count;
@@ -48,5 +50,6 @@ bool queue_await_resume_job(struct coroutine *coro, ant_value_t value);
 int has_pending_timers(ant_t *js);
 int has_pending_microtasks(ant_t *js);
 int has_pending_immediates(ant_t *js);
+int has_active_immediates(ant_t *js);
 
 #endif

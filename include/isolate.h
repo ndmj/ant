@@ -12,6 +12,7 @@
 
 #include "esm/loader.h"
 #include "modules/json.h"
+#include "modules/math.h"
 #include "modules/timer.h"
 
 typedef struct {
@@ -42,6 +43,10 @@ static constexpr int MAX_PROTO_CHAIN_DEPTH = 256;
 static constexpr int MAX_MULTIREF_OBJS     = 128;
 static constexpr int MAX_DENSE_INITIAL_CAP = 8;
 
+// new Array(n) allocates dense storage for the whole length up to this
+// many elements, so filling it stays on the fast path
+static constexpr uint32_t MAX_DENSE_PREALLOC_LEN = 65536;
+
 struct ant_isolate_t {
   sv_vm_t *vm;
   void *jit_ctx;
@@ -60,11 +65,15 @@ struct ant_isolate_t {
   ant_fixed_arena_t obj_arena;
   ant_fixed_arena_t closure_arena;
   ant_fixed_arena_t upvalue_arena;
+  
   uint32_t prototype_write_epoch;
+  uint32_t array_chain_plain_epoch;
 
   bool promise_constructor_protector_invalid;
   bool promise_resolve_lookup_protector_invalid;
   bool promise_species_protector_invalid;
+  bool array_species_protector_invalid;
+  bool array_iteration_protector_invalid;
   bool promise_then_protector_invalid;
 
   struct {
@@ -91,6 +100,7 @@ struct ant_isolate_t {
   ant_value_t this_val;
   ant_value_t current_func;
   ant_value_t length_str;
+  ant_value_t empty_str;
   ant_value_t ascii_chars[128];
 
   // TODO: struct
@@ -132,6 +142,7 @@ struct ant_isolate_t {
     const char *set;
     const char *arguments;
     const char *callee;
+    const char *next;
     const char *idx[10];
   } intern;
 
@@ -173,6 +184,12 @@ struct ant_isolate_t {
     ant_value_t bigint_proto;
     ant_value_t symbol_proto;
     ant_value_t array_values_fn;
+    ant_value_t array_push_fn;
+    ant_value_t array_ctor;
+    ant_value_t array_iterator_next;
+    ant_value_t string_ctor;
+    ant_value_t number_to_string_fn;
+    ant_value_t math_fns[ANT_MATH_INTRINSIC_COUNT];
     ant_value_t iterator_proto;
     ant_value_t array_iterator_proto;
     ant_value_t string_iterator_proto;
@@ -219,6 +236,8 @@ struct ant_isolate_t {
     size_t upvalues;
     size_t arrays;
   } alloc_bytes;
+  
+  gc_array_storage_cache_t array_storage;
   
   struct {
     size_t last_live;

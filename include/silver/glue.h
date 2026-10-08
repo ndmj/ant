@@ -6,8 +6,8 @@
 int64_t jit_helper_stack_overflow(ant_t *js);
 int64_t jit_helper_is_truthy(ant_t *js, ant_value_t v);
 
+void jit_helper_disable_param_counters(sv_func_t *func, uint64_t params);
 void jit_helper_shape_transition(ant_t *js, ant_object_t *obj, ant_shape_t *to_shape);
-ant_value_t jit_helper_normalize_sloppy_this(ant_t *js, ant_value_t value);
 
 ant_value_t jit_helper_add(sv_vm_t *vm, ant_t *js, ant_value_t l, ant_value_t r);
 ant_value_t jit_helper_sub(sv_vm_t *vm, ant_t *js, ant_value_t l, ant_value_t r);
@@ -16,10 +16,12 @@ ant_value_t jit_helper_div(sv_vm_t *vm, ant_t *js, ant_value_t l, ant_value_t r)
 ant_value_t jit_helper_mod(sv_vm_t *vm, ant_t *js, ant_value_t l, ant_value_t r);
 
 ant_value_t jit_helper_import_default(ant_t *js, ant_value_t ns);
-ant_value_t jit_helper_get_length(sv_vm_t *vm, ant_t *js, ant_value_t obj);
-ant_value_t jit_helper_get_length_inline(sv_vm_t *vm, ant_t *js, ant_value_t obj);
+ant_value_t jit_helper_get_length(ant_t *js, ant_value_t obj);
+ant_value_t jit_helper_get_length_inline(ant_t *js, ant_value_t obj);
 ant_value_t jit_helper_catch_value(sv_vm_t *vm, ant_t *js, ant_value_t err);
 ant_value_t jit_helper_throw(sv_vm_t *vm, ant_t *js, ant_value_t val);
+ant_value_t jit_helper_native_finish(ant_t *js, ant_value_t result);
+ant_value_t jit_helper_normalize_sloppy_this(ant_t *js, ant_value_t value);
 
 ant_value_t jit_helper_lt(sv_vm_t *vm, ant_t *js, ant_value_t l, ant_value_t r);
 ant_value_t jit_helper_le(sv_vm_t *vm, ant_t *js, ant_value_t l, ant_value_t r);
@@ -272,6 +274,11 @@ void jit_helper_upval_barrier(
   sv_upvalue_t *uv, ant_value_t val
 );
 
+void jit_helper_upval_flagged(
+  ant_t *js,
+  sv_upvalue_t *uv, ant_value_t val
+);
+
 void jit_helper_adopt_open_upvalues(
   sv_vm_t *vm,
   sv_upvalue_t **open_upvalues
@@ -330,6 +337,15 @@ ant_value_t jit_helper_put_elem(
 ant_value_t jit_helper_put_elem_strict(
   sv_vm_t *vm, ant_t *js,
   ant_value_t obj, ant_value_t key, ant_value_t val
+);
+
+ant_value_t jit_helper_number_to_string(
+  sv_vm_t *vm, ant_t *js, ant_value_t value
+);
+
+void jit_helper_elem_barrier(
+  ant_t *js, ant_value_t arr,
+  uint64_t idx, ant_value_t val
 );
 
 ant_value_t jit_helper_put_global(

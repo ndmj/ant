@@ -113,7 +113,7 @@ typedef union ant_object_flags {
     uint8_t in_remember_set: 1;
     uint8_t guards_absence: 1;
     uint8_t dense_length_fits: 1;
-    uint8_t strict_arguments: 1;
+    uint8_t arguments_object: 1;
     uint8_t regexp_brand: 1;
   };
   uint16_t raw;
@@ -131,6 +131,8 @@ typedef enum: uint16_t {
     1u << 3,
   ANT_OBJECT_FLAG_FAST_ARRAY =
     1u << 6,
+  ANT_OBJECT_FLAG_MAY_HAVE_DENSE_ELEMENTS =
+    1u << 8,
   ANT_OBJECT_FLAG_GENERATION =
     1u << 10,
   ANT_OBJECT_FLAG_REMEMBERED =
@@ -139,7 +141,7 @@ typedef enum: uint16_t {
     1u << 12,
   ANT_OBJECT_FLAG_DENSE_LENGTH_FITS =
     1u << 13,
-  ANT_OBJECT_FLAG_STRICT_ARGUMENTS =
+  ANT_OBJECT_FLAG_ARGUMENTS =
     1u << 14,
   ANT_OBJECT_FLAG_REGEXP_BRAND =
     1u << 15,
@@ -166,6 +168,9 @@ static inline bool ant_object_flag_masks_match_layout(void) {
   flags = (ant_object_flags_t){.fast_array = 1};
   if (flags.raw != ANT_OBJECT_FLAG_FAST_ARRAY) return false;
 
+  flags = (ant_object_flags_t){.may_have_dense_elements = 1};
+  if (flags.raw != ANT_OBJECT_FLAG_MAY_HAVE_DENSE_ELEMENTS) return false;
+
   flags = (ant_object_flags_t){.generation = 1};
   if (flags.raw != ANT_OBJECT_FLAG_GENERATION) return false;
 
@@ -178,8 +183,8 @@ static inline bool ant_object_flag_masks_match_layout(void) {
   flags = (ant_object_flags_t){.dense_length_fits = 1};
   if (flags.raw != ANT_OBJECT_FLAG_DENSE_LENGTH_FITS) return false;
 
-  flags = (ant_object_flags_t){.strict_arguments = 1};
-  if (flags.raw != ANT_OBJECT_FLAG_STRICT_ARGUMENTS) return false;
+  flags = (ant_object_flags_t){.arguments_object = 1};
+  if (flags.raw != ANT_OBJECT_FLAG_ARGUMENTS) return false;
 
   flags = (ant_object_flags_t){.regexp_brand = 1};
   return flags.raw == ANT_OBJECT_FLAG_REGEXP_BRAND;
@@ -220,6 +225,29 @@ typedef struct ant_object {
   ant_object_flags_t flags;
   uint32_t ic_identity;
 } ant_object_t;
+
+static constexpr size_t ANT_OBJECT_FLAGS_HIGH_BYTE = offsetof(ant_object_t, flags) + 1;
+
+static_assert(
+  __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, 
+  "ANT_OBJECT_FLAGS_HIGH_BYTE assumes a little-endian flags word"
+);
+
+static_assert(
+  ANT_OBJECT_FLAG_ARGUMENTS >= 0x100, 
+  "the arguments flag must live in the high flags byte"
+);
+
+static_assert(
+  (0xffffu & ~((ANT_OBJECT_FLAG_ARGUMENTS << 1) - 1u)) == ANT_OBJECT_FLAG_REGEXP_BRAND,
+  "only the RegExp brand may sit above the arguments flag"
+);
+
+enum {
+  ANT_ARGUMENTS_SLOT_LENGTH = 0,
+  ANT_ARGUMENTS_SLOT_CALLEE = 1,
+  ANT_ARGUMENTS_SLOT_ITERATOR = 2,
+};
 
 static inline void ant_object_guard_absence(ant_object_t *obj) {
   if (obj) obj->flags.guards_absence = 1;

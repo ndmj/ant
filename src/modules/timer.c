@@ -8,6 +8,7 @@
 
 #include "errors.h"
 #include "builder.h"
+#include "ptr.h"
 #include "internal.h"
 #include "silver/call.h"
 
@@ -31,6 +32,8 @@ typedef struct timer_entry {
   int active;
   int closed;
   int is_interval;
+  bool handle_closed;
+  bool detached;
   uint64_t timeout_ms;
   struct timer_entry *next;
   struct timer_entry *prev;
@@ -60,7 +63,11 @@ typedef struct immediate_entry {
   ant_value_t callback;
   int immediate_id;
   int active;
+  bool refed;
+  ant_value_t handle;
   struct immediate_entry *next;
+  int argc;
+  ant_value_t argv[];
 } immediate_entry_t;
 
 static void add_timer_entry(ant_t *js, timer_entry_t *entry) {
@@ -134,25 +141,56 @@ static ant_value_t timer_make_args_array(ant_native_params_t) {
   return arr;
 }
 
+static constexpr uint32_t TIMER_NATIVE_TAG = 0x54494d52u; // TIMR
+static timer_entry_t *timer_entry_of(ant_value_t handle) {
+  return is_object_type(handle) ? js_get_native(handle, TIMER_NATIVE_TAG) : NULL;
+}
+
+static timer_entry_t *timer_open_entry_of(ant_value_t handle) {
+  timer_entry_t *entry = timer_entry_of(handle);
+  return entry && !entry->closed ? entry : NULL;
+}
+
 static ant_value_t timer_to_primitive(ant_params_t) {
-  return js_get_slot(js_getthis(js), SLOT_DATA);
+  timer_entry_t *entry = timer_entry_of(js_getthis(js));
+  return entry ? js_mknum((double)entry->timer_id) : js_mkundef();
+}
+
+static constexpr uint32_t IMMEDIATE_NATIVE_TAG = 0x494d4d44u; // IMMD
+static immediate_entry_t *immediate_entry_of(ant_value_t handle) {
+  return is_object_type(handle) ? js_get_native(handle, IMMEDIATE_NATIVE_TAG) : NULL;
 }
 
 static ant_value_t timer_inspect(ant_params_t) {
   ant_value_t this_obj = js_getthis(js);
-  ant_value_t id_val = js_get_slot(this_obj, SLOT_DATA);
-  int timer_id = vtype(id_val) == kTypeNumber ? (int)js_getnum(id_val) : 0;
+  timer_entry_t *entry = timer_entry_of(this_obj);
+  immediate_entry_t *immediate = immediate_entry_of(this_obj);
+  
+  ant_value_t refed = js_mknull();
+  bool destroyed = true;
+  
+  if (entry) {
+    refed = js_bool(uv_has_ref((const uv_handle_t *)&entry->handle));
+    destroyed = entry->closed || !entry->active;
+  } else if (immediate && immediate->active) {
+    refed = js_bool(immediate->refed);
+    destroyed = false;
+  }
 
   ant_value_t tag_val = js_get_sym(js, this_obj, js->sym.toStringTag_sym);
   const char *tag = vtype(tag_val) == kTypeString ? js_getstr(js, tag_val, NULL) : "Timeout";
 
   js_inspect_builder_t builder;
-  if (!js_inspect_builder_init_dynamic(&builder, js, 128)) {
+  if (!js_inspect_builder_init_dynamic(&builder, js, 128))
     return js_mkerr(js, "out of memory");
-  }
 
-  bool ok = js_inspect_header(&builder, "%s (%d)", tag, timer_id);
+  bool ok = entry
+    ? js_inspect_header(&builder, "%s (%d)", tag, entry->timer_id)
+    : js_inspect_header(&builder, "%s", tag);
+  
   if (ok) ok = js_inspect_object_body(&builder, this_obj);
+  if (ok) ok = js_inspect_field(&builder, "Symbol(refed)", refed);
+  if (ok) ok = js_inspect_field(&builder, "Symbol(destroyed)", js_bool(destroyed));
   if (ok) ok = js_inspect_close(&builder);
   
   if (!ok) {
@@ -165,35 +203,75 @@ static ant_value_t timer_inspect(ant_params_t) {
 
 static ant_value_t js_timer_ref(ant_params_t) {
   ant_value_t this_obj = js_getthis(js);
-  timer_entry_t *entry = find_timer_entry_by_id(js, (int)js_getnum(js_get_slot(this_obj, SLOT_DATA)));
-  if (entry && !entry->closed && !uv_is_closing((uv_handle_t *)&entry->handle)) {
+  timer_entry_t *entry = timer_open_entry_of(this_obj);
+  
+  if (entry) {
     int was_refed = uv_has_ref((const uv_handle_t *)&entry->handle);
     uv_ref((uv_handle_t *)&entry->handle);
     if (entry->active && !was_refed) js->timers.active_refed_timer_count++;
   }
+  
   return this_obj;
 }
 
 static ant_value_t js_timer_unref(ant_params_t) {
   ant_value_t this_obj = js_getthis(js);
-  timer_entry_t *entry = find_timer_entry_by_id(js, (int)js_getnum(js_get_slot(this_obj, SLOT_DATA)));
-  if (entry && !entry->closed && !uv_is_closing((uv_handle_t *)&entry->handle)) {
+  timer_entry_t *entry = timer_open_entry_of(this_obj);
+  
+  if (entry) {
     int was_refed = uv_has_ref((const uv_handle_t *)&entry->handle);
     uv_unref((uv_handle_t *)&entry->handle);
     if (entry->active && was_refed) js->timers.active_refed_timer_count--;
   }
+  
   return this_obj;
 }
 
 static ant_value_t js_timer_has_ref(ant_params_t) {
-  timer_entry_t *entry = find_timer_entry_by_id(js, (int)js_getnum(js_get_slot(js_getthis(js), SLOT_DATA)));
-  if (!entry || entry->closed || uv_is_closing((uv_handle_t *)&entry->handle)) return js_false;
+  timer_entry_t *entry = timer_open_entry_of(js_getthis(js));
+  if (!entry) return js_false;
   return js_bool(uv_has_ref((const uv_handle_t *)&entry->handle) != 0);
 }
 
-static int timer_id_from_arg(ant_t *js, ant_value_t arg) {
-  if (vtype(arg) == kTypeNumber) return (int)js_getnum(arg);
-  return (int)js_getnum(js_get_slot(arg, SLOT_DATA));
+static void immediate_detach_handle(immediate_entry_t *entry) {
+  if (is_object_type(entry->handle)) js_clear_native(entry->handle, IMMEDIATE_NATIVE_TAG);
+  entry->handle = js_mkundef();
+}
+
+static ant_value_t js_immediate_ref(ant_params_t) {
+  immediate_entry_t *entry = immediate_entry_of(js_getthis(js));
+  if (entry) entry->refed = true;
+  return js_getthis(js);
+}
+
+static ant_value_t js_immediate_unref(ant_params_t) {
+  immediate_entry_t *entry = immediate_entry_of(js_getthis(js));
+  if (entry) entry->refed = false;
+  return js_getthis(js);
+}
+
+static ant_value_t js_immediate_has_ref(ant_params_t) {
+  immediate_entry_t *entry = immediate_entry_of(js_getthis(js));
+  return js_bool(entry && entry->active && entry->refed);
+}
+
+static ant_value_t js_immediate_dispose(ant_params_t) {
+  immediate_entry_t *entry = immediate_entry_of(js_getthis(js));
+  if (entry) entry->active = 0;
+  return js_mkundef();
+}
+
+static ant_value_t immediate_make_object(ant_t *js, immediate_entry_t *entry) {
+  ant_value_t obj = js_mkobj_from_template(js, js->builtins.immediate_template);
+  if (is_err(obj)) return obj;
+  
+  ant_object_t *ptr = js_obj_ptr(obj);
+  ant_object_prop_set_unchecked(ptr, 0, entry->callback);
+  gc_write_barrier(js, ptr, entry->callback);
+  js_set_native(obj, entry, IMMEDIATE_NATIVE_TAG);
+  entry->handle = obj;
+  
+  return obj;
 }
 
 // uv_close completes on a later loop turn, possibly after the isolate is gone,
@@ -202,7 +280,8 @@ static void timer_close_cb(uv_handle_t *h) {
   timer_entry_t *entry = (timer_entry_t *)h->data;
   if (!entry) return;
   timer_release_callback_args(entry);
-  free(entry);
+  entry->handle_closed = true;
+  if (entry->detached) free(entry);
 }
 
 static void timer_close_entry(timer_entry_t *entry) {
@@ -223,29 +302,39 @@ static void timer_close_entry(timer_entry_t *entry) {
     uv_close((uv_handle_t *)&entry->handle, timer_close_cb);
 }
 
+// the entry outlives its uv handle while the timer object is alive, and is
+// freed by whichever of uv_close and the object's finalizer finishes last
 static void timer_object_finalize(ant_t *js, ant_object_t *obj) {
-  ant_value_t timer_obj = js_obj_from_ptr(obj);
-  int timer_id = (int)js_getnum(js_get_slot(timer_obj, SLOT_DATA));
-  timer_entry_t *entry = find_timer_entry_by_id(js, timer_id);
-  if (entry) timer_close_entry(entry);
+  timer_entry_t *entry = timer_entry_of(js_obj_from_ptr(obj));
+  if (!entry) return;
+  
+  entry->detached = true;
+  if (!entry->closed) timer_close_entry(entry);
+  else if (entry->handle_closed) free(entry);
 }
 
-static ant_value_t timer_make_object(
-  ant_t *js, timer_entry_t *entry, 
-  double delay_ms, int is_interval, ant_value_t timer_args
-) {
-  ant_value_t obj = js_mkobj(js);
-  ant_value_t proto = is_interval ? js->builtins.interval_proto : js->builtins.timeout_proto;
-  if (is_object_type(proto)) js_set_proto_init(obj, proto);
-
-  js_set(js, obj, "delay", js_mknum(delay_ms));
-  js_set(js, obj, "repeat", is_interval ? js_mknum(delay_ms) : js_mknull());
-  js_set(js, obj, "callback", entry->callback);
-  js_set_descriptor(js, obj, "callback", 8, JS_DESC_W | JS_DESC_C);
+static ant_value_t timer_make_object(ant_t *js, timer_entry_t *entry, double delay_ms, ant_value_t timer_args) {
+  ant_value_t obj = js_mkobj_from_template(js, entry->is_interval 
+    ? js->builtins.interval_template 
+    : js->builtins.timeout_template
+  );
   
-  js_set_slot(obj, SLOT_DATA, js_mknum((double)entry->timer_id));
-  js_set_slot_wb(js, obj, SLOT_AUX, timer_args);
-  js_set_sym(js, obj, js->sym.toPrimitive_sym, js_mkfun(timer_to_primitive));
+  if (is_err(obj)) {
+    entry->detached = true;
+    timer_close_entry(entry);
+    return obj;
+  }
+
+  ant_object_t *ptr = js_obj_ptr(obj);
+  ant_value_t delay = js_mknum(delay_ms);
+  
+  ant_object_prop_set_unchecked(ptr, 0, delay);
+  ant_object_prop_set_unchecked(ptr, 1, entry->is_interval ? delay : js_mknull());
+  ant_object_prop_set_unchecked(ptr, 2, entry->callback);
+  gc_write_barrier(js, ptr, entry->callback);
+  
+  if (vtype(timer_args) != kTypeUndefined) js_set_slot_wb(js, obj, SLOT_AUX, timer_args);
+  js_set_native(obj, entry, TIMER_NATIVE_TAG);
   js_set_finalizer(obj, timer_object_finalize);
   entry->obj = obj;
 
@@ -282,8 +371,8 @@ static void timer_callback(uv_timer_t *handle) {
 static ant_value_t js_timer_refresh(ant_params_t) {
   ant_value_t this_obj = js_getthis(js);
   
-  timer_entry_t *entry = find_timer_entry_by_id(js, (int)js_getnum(js_get_slot(this_obj, SLOT_DATA)));
-  if (!entry || entry->closed || uv_is_closing((uv_handle_t *)&entry->handle)) return this_obj;
+  timer_entry_t *entry = timer_open_entry_of(this_obj);
+  if (!entry) return this_obj;
 
   if (!entry->active) {
     if (vtype(entry->callback) == kTypeUndefined) {
@@ -341,7 +430,7 @@ static ant_value_t js_set_timeout(ant_params_t) {
   js->timers.active_refed_timer_count++;
   uv_timer_start(&entry->handle, timer_callback, ms, 0);
 
-  return timer_make_object(js, entry, delay_ms, 0, timer_args);
+  return timer_make_object(js, entry, delay_ms, timer_args);
 }
 
 // setInterval(callback, delay, ...args)
@@ -377,39 +466,41 @@ static ant_value_t js_set_interval(ant_params_t) {
   js->timers.active_refed_timer_count++;
   uv_timer_start(&entry->handle, timer_callback, ms, ms);
 
-  return timer_make_object(js, entry, delay_ms, 1, timer_args);
+  return timer_make_object(js, entry, delay_ms, timer_args);
 }
 
 // clearTimeout(timerId | timerObject)
 static ant_value_t js_clear_timeout(ant_params_t) {
   if (nargs < 1) return js_mkundef();
-  int timer_id = timer_id_from_arg(js, args[0]);
   
-  for (timer_entry_t *entry = js->timers.timers; entry != NULL; entry = entry->next) {
-  if (entry->timer_id == timer_id && !entry->closed) {
-    timer_close_entry(entry);
-    break;
-  }}
+  timer_entry_t *entry = timer_open_entry_of(args[0]);
+  if (!entry && vtype(args[0]) == kTypeNumber) entry = find_timer_entry_by_id(js, (int)js_getnum(args[0]));
+  if (entry) timer_close_entry(entry);
   
   return js_mkundef();
 }
 
-// setImmediate(callback)
+// setImmediate(callback, ...args)
 static ant_value_t js_set_immediate(ant_params_t) {
   if (nargs < 1) {
     return js_mkerr(js, "setImmediate requires 1 argument (callback)");
   }
   
   ant_value_t callback = args[0];
+  int argc = nargs - 1;
   
-  immediate_entry_t *entry = calloc(1, sizeof(immediate_entry_t));
+  immediate_entry_t *entry = calloc(1, sizeof(immediate_entry_t) + (size_t)argc * sizeof(ant_value_t));
   if (entry == NULL) {
     return js_mkerr(js, "failed to allocate immediate");
   }
   
   entry->callback = callback;
+  entry->argc = argc;
+  for (int i = 0; i < argc; i++) entry->argv[i] = args[i + 1];
   entry->immediate_id = js->timers.next_immediate_id++;
   entry->active = 1;
+  entry->refed = true;
+  entry->handle = js_mkundef();
   entry->next = NULL;
   
   if (js->timers.immediates_tail == NULL) {
@@ -420,20 +511,22 @@ static ant_value_t js_set_immediate(ant_params_t) {
     js->timers.immediates_tail = entry;
   }
 
-  ant_value_t obj = js_mkobj(js);
-  js_set(js, obj, "id", js_mknum((double)entry->immediate_id));
-  js_set(js, obj, "callback", callback);
-  
-  return obj;
+  return immediate_make_object(js, entry);
 }
 
 // clearImmediate(immediateId | immediateObject)
 static ant_value_t js_clear_immediate(ant_params_t) {
   if (nargs < 1) return js_mkundef();
-  int immediate_id = timer_id_from_arg(js, args[0]);
   
-  for (immediate_entry_t *entry = js->timers.immediates; entry != NULL; entry = entry->next) {
-    if (entry->immediate_id == immediate_id) { entry->active = 0; break; }
+  immediate_entry_t *entry = immediate_entry_of(args[0]);
+  if (entry) entry->active = 0;
+  else if (vtype(args[0]) == kTypeNumber) {
+    int immediate_id = (int)js_getnum(args[0]);
+    immediate_entry_t *lists[2] = { js->timers.immediates_processing, js->timers.immediates };
+    for (int l = 0; l < 2 && !entry; l++)
+      for (immediate_entry_t *it = lists[l]; it; it = it->next)
+        if (it->immediate_id == immediate_id) { entry = it; break; }
+    if (entry) entry->active = 0;
   }
   
   return js_mkundef();
@@ -912,15 +1005,23 @@ bool js_maybe_drain_microtasks_after_async_settle(ant_t *js) {
 }
 
 void process_immediates(ant_t *js) {
-  while (js->timers.immediates != NULL) {
-    immediate_entry_t *entry = js->timers.immediates;
-    
-    js->timers.immediates = entry->next;
-    if (js->timers.immediates == NULL) js->timers.immediates_tail = NULL;
+  ant_timer_state_t *t = &js->timers;
+  if (t->immediates_processing) return;
+  
+  t->immediates_processing = t->immediates;
+  t->immediates = t->immediates_tail = NULL;
+  
+  while (t->immediates_processing) {
+    immediate_entry_t *entry = t->immediates_processing;
+    t->immediates_processing = entry->next;
+    immediate_detach_handle(entry);
     
     if (entry->active) {
-      ant_value_t args[0];
-      sv_vm_call(js->vm, js, entry->callback, js_mkundef(), args, 0, NULL, js_mkundef());
+      GC_ROOT_SAVE(root_mark, js);
+      GC_ROOT_PIN(js, entry->callback);
+      for (int i = 0; i < entry->argc; i++) GC_ROOT_PIN(js, entry->argv[i]);
+      sv_vm_call(js->vm, js, entry->callback, js_mkundef(), entry->argv, entry->argc, NULL, js_mkundef());
+      GC_ROOT_RESTORE(js, root_mark);
       process_report_uncaught_exception_if_pending(js);
       process_microtasks(js);
     }
@@ -930,6 +1031,14 @@ void process_immediates(ant_t *js) {
 }
 
 int has_pending_immediates(ant_t *js) {
+  for (
+    immediate_entry_t *entry = js->timers.immediates;
+    entry != NULL; entry = entry->next
+  ) if (entry->active && entry->refed) return 1;
+  return 0;
+}
+
+int has_active_immediates(ant_t *js) {
   for (
     immediate_entry_t *entry = js->timers.immediates;
     entry != NULL; entry = entry->next
@@ -955,6 +1064,16 @@ static void timers_define_common(ant_t *js, ant_value_t obj) {
   js_set(js, obj, "queueMicrotask", js_mkfun(js_queue_microtask));
 }
 
+static ant_value_t timer_make_template(ant_t *js, ant_value_t proto, ant_value_t repeat) {
+  ant_value_t template = js_mkobj(js);
+  js_set_proto_init(template, proto);
+  js_set(js, template, "delay", js_mknum(0));
+  js_set(js, template, "repeat", repeat);
+  js_set(js, template, "callback", js_mkundef());
+  js_set_descriptor(js, template, "callback", 8, JS_DESC_W | JS_DESC_C);
+  return template;
+}
+
 void init_timer_module(ant_t *js) {
   js->timers.next_timer_id = 1;
   js->timers.next_immediate_id = 1;
@@ -971,6 +1090,23 @@ void init_timer_module(ant_t *js) {
   js_set(js, js->builtins.timeout_proto, "refresh", js_mkfun(js_timer_refresh));
   js_set_sym(js, js->builtins.timeout_proto, js->sym.toStringTag_sym, js_mkstr(js, "Timeout", 7));
   js_set_sym(js, js->builtins.timeout_proto, js->sym.inspect_sym, js_mkfun(timer_inspect));
+  js_set_sym(js, js->builtins.timeout_proto, js->sym.toPrimitive_sym, js_mkfun(timer_to_primitive));
+
+  js->builtins.immediate_proto = js_mkobj(js);
+  gc_register_root(&js->builtins.immediate_proto);
+  js_set_proto_init(js->builtins.immediate_proto, js->sym.object_proto);
+  js_set(js, js->builtins.immediate_proto, "ref", js_mkfun(js_immediate_ref));
+  js_set(js, js->builtins.immediate_proto, "unref", js_mkfun(js_immediate_unref));
+  js_set(js, js->builtins.immediate_proto, "hasRef", js_mkfun(js_immediate_has_ref));
+  js_set_sym(js, js->builtins.immediate_proto, js->sym.dispose_sym, js_mkfun(js_immediate_dispose));
+  js_set_sym(js, js->builtins.immediate_proto, js->sym.toStringTag_sym, js_mkstr(js, "Immediate", 9));
+  js_set_sym(js, js->builtins.immediate_proto, js->sym.inspect_sym, js_mkfun(timer_inspect));
+
+  js->builtins.immediate_template = js_mkobj(js);
+  gc_register_root(&js->builtins.immediate_template);
+  js_set_proto_init(js->builtins.immediate_template, js->builtins.immediate_proto);
+  js_set(js, js->builtins.immediate_template, "callback", js_mkundef());
+  js_set_descriptor(js, js->builtins.immediate_template, "callback", 8, JS_DESC_W | JS_DESC_C);
 
   js_set_proto_init(js->builtins.interval_proto, js->sym.object_proto);
   js_set(js, js->builtins.interval_proto, "ref", js_mkfun(js_timer_ref));
@@ -979,6 +1115,12 @@ void init_timer_module(ant_t *js) {
   js_set(js, js->builtins.interval_proto, "refresh", js_mkfun(js_timer_refresh));
   js_set_sym(js, js->builtins.interval_proto, js->sym.toStringTag_sym, js_mkstr(js, "Interval", 8));
   js_set_sym(js, js->builtins.interval_proto, js->sym.inspect_sym, js_mkfun(timer_inspect));
+  js_set_sym(js, js->builtins.interval_proto, js->sym.toPrimitive_sym, js_mkfun(timer_to_primitive));
+  
+  js->builtins.timeout_template = timer_make_template(js, js->builtins.timeout_proto, js_mknull());
+  js->builtins.interval_template = timer_make_template(js, js->builtins.interval_proto, js_mknum(0));
+  gc_register_root(&js->builtins.timeout_template);
+  gc_register_root(&js->builtins.interval_template);
 
   timers_define_common(js, js_glob(js));
 }
@@ -1026,7 +1168,7 @@ void cleanup_timer_module(ant_t *js) {
   ant_timer_state_t *t = &js->timers;
   
   ANT_ASSERT(
-    !t->microtasks_processing && !t->next_ticks_processing,
+    !t->microtasks_processing && !t->next_ticks_processing && !t->immediates_processing,
     "cannot destroy an isolate while it runs a job batch"
   );
 
@@ -1079,5 +1221,10 @@ void gc_mark_timers(ant_t *js, gc_mark_fn mark) {
     for (uint8_t i = 0; i < m->argc; i++) mark(js, m->argv[i]);
   }
   
-  for (immediate_entry_t *i = js->timers.immediates; i; i = i->next) mark(js, i->callback);
+  immediate_entry_t *immediate_lists[2] = { js->timers.immediates, js->timers.immediates_processing };
+  for (int l = 0; l < 2; l++) for (immediate_entry_t *i = immediate_lists[l]; i; i = i->next) {
+    mark(js, i->callback);
+    mark(js, i->handle);
+    for (int a = 0; a < i->argc; a++) mark(js, i->argv[a]);
+  }
 }
