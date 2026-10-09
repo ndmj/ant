@@ -61,6 +61,8 @@ typedef struct immediate_entry {
   int immediate_id;
   int active;
   struct immediate_entry *next;
+  int argc;                    // Number of extra arguments
+  ant_value_t *args;           // Array of extra arguments
 } immediate_entry_t;
 
 static struct {
@@ -445,6 +447,18 @@ static ant_value_t js_set_immediate(ant_params_t) {
   }
   
   entry->callback = callback;
+
+  // Capture any extra arguments passed to setImmediate (e.g., null, session)
+  entry->argc = nargs > 1 ? nargs - 1 : 0;
+  if (entry->argc > 0) {
+      entry->args = malloc(sizeof(ant_value_t) * entry->argc);
+      for (int i = 0; i < entry->argc; i++) {
+          entry->args[i] = args[i + 1];
+          // Make sure to pin/protect them from GC if antjs uses a garbage collector!
+          // e.g., js_pin(js, entry->args[i]);
+      }
+  }
+
   entry->immediate_id = timer_state.next_immediate_id++;
   entry->active = 1;
   entry->next = NULL;
@@ -470,7 +484,18 @@ static ant_value_t js_clear_immediate(ant_params_t) {
   int immediate_id = timer_id_from_arg(js, args[0]);
   
   for (immediate_entry_t *entry = timer_state.immediates; entry != NULL; entry = entry->next) {
-    if (entry->immediate_id == immediate_id) { entry->active = 0; break; }
+    if (entry->immediate_id == immediate_id) { 
+      entry->active = 0; 
+      
+      // Clean up extra arguments if they were allocated
+      if (entry->args) {
+        free(entry->args);
+        entry->args = NULL;
+        entry->argc = 0;
+      }
+      
+      break; 
+    }
   }
   
   return js_mkundef();
@@ -955,12 +980,25 @@ void process_immediates(ant_t *js) {
     if (timer_state.immediates == NULL) timer_state.immediates_tail = NULL;
     
     if (entry->active) {
-      ant_value_t args[0];
-      sv_vm_call(js->vm, js, entry->callback, js_mkundef(), args, 0, NULL, js_mkundef());
+      // Pin arguments so the GC doesn't collect them during execution
+      GC_ROOT_SAVE(root_mark, js);
+      for (int i = 0; i < entry->argc; i++) {
+        GC_ROOT_PIN(js, entry->args[i]);
+      }
+
+      // Pass the captured args and argc to the virtual machine call
+      sv_vm_call(js->vm, js, entry->callback, js_mkundef(), entry->args, entry->argc, NULL, js_mkundef());
+      
+      GC_ROOT_RESTORE(js, root_mark);
+
       process_report_uncaught_exception_if_pending(js);
       process_microtasks(js);
     }
     
+    // Clean up allocated args array if it exists
+    if (entry->args) {
+      free(entry->args);
+    }
     free(entry);
   }
 }

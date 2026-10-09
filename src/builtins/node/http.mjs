@@ -243,7 +243,7 @@ function buildHeadersFromFetch(response) {
     rawHeaders.push(name, value);
     appendHeaderValue(headers, normalizeHeaderName(name), value);
   }
-
+  
   return { headers, rawHeaders };
 }
 
@@ -915,14 +915,15 @@ export class IncomingMessage extends Readable {
     this.aborted = false;
     this.destroyed = false;
     this.readableEnded = false;
-    this._body = bufferFrom(parsed.body);
+    // Express (body-parser) depends on _body (true, false) to indicate if already parsed
+    this._rawBody = bufferFrom(parsed.body);
     this._bodyConsumed = false;
   }
 
   _takeBody() {
     if (this._bodyConsumed) return Buffer.alloc(0);
     this._bodyConsumed = true;
-    return this._body;
+    return this._rawBody;
   }
 
   _deliverBody() {
@@ -991,6 +992,8 @@ export class ServerResponse extends EventEmitter {
     this.writableEnded = false;
     this.writableFinished = false;
     this.finished = false;
+    // Internal field that starts as null and is set to raw header string
+    this._header = null;
     this._headers = createHeadersObject();
     this._headerNames = createHeadersObject();
     this._socketState = socketState;
@@ -1047,15 +1050,37 @@ export class ServerResponse extends EventEmitter {
     return this;
   }
 
-  writeHead(statusCode, statusMessage, headers) {
+  writeHead(statusCode, statusMessage, headers, bodySize) {
+    // Handle Node.js argument overloading:
+    // res.writeHead(statusCode)
+    // res.writeHead(statusCode, headers)
+    // res.writeHead(statusCode, statusMessage)
+    // res.writeHead(statusCode, statusMessage, headers)
+    if (typeof statusMessage === 'object' && statusMessage !== null) {
+      headers = statusMessage;
+      statusMessage = undefined;
+    }
+
     this.statusCode = statusCode | 0;
 
     if (typeof statusMessage === 'string') {
       this.statusMessage = statusMessage;
-      applyHeaderObject(this, headers);
-    } else {
-      applyHeaderObject(this, statusMessage);
     }
+
+    if (headers) {
+      applyHeaderObject(this, headers);
+    }
+
+    let resolvedBodySize = 0;
+    if (!this._streaming) {
+      // Determine body size: use passed bodySize, or check Content-Length header, or default to 0
+      resolvedBodySize = bodySize !== undefined 
+        ? bodySize 
+        : (Number(this.getHeader('content-length')) || 0);
+    }
+
+    // Now actually write headers to the socket!
+    this._writeHead(this._streaming, resolvedBodySize);
 
     return this;
   }
@@ -1073,6 +1098,35 @@ export class ServerResponse extends EventEmitter {
     });
 
     return rawHeaders;
+  }
+
+  _implicitHeader() {
+    if (this._header) return this._header;
+
+    const statusCode = this.statusCode;
+    const statusMessage = this.statusMessage || 'OK';
+    
+    let headerString = `HTTP/1.1 ${statusCode} ${statusMessage}\r\n`;
+
+    // Use Ant's existing _headerNames to get proper casing, fallback to lowercase keys
+    const headers = this._headers || {};
+    const headerNames = this._headerNames || {};
+
+    for (const [key, value] of Object.entries(headers)) {
+      const name = headerNames[key] || key;
+      if (Array.isArray(value)) {
+        for (const v of value) {
+          headerString += `${name}: ${v}\r\n`;
+        }
+      } else {
+        headerString += `${name}: ${value}\r\n`;
+      }
+    }
+
+    headerString += '\r\n';
+    this._header = headerString;
+
+    return this._header;
   }
 
   _shouldKeepAlive() {
@@ -1100,9 +1154,10 @@ export class ServerResponse extends EventEmitter {
       ? bufferFrom(chunk, typeof encoding === 'string' ? encoding : undefined)
       : Buffer.alloc(0);
 
-    if (typeof encoding === 'function') callback = encoding;
-    if (!this.headersSent) this._writeHead(true, 0);
     this._streaming = true;
+
+    if (typeof encoding === 'function') callback = encoding;
+    if (!this.headersSent) this.writeHead(this.statusCode, this.statusMessage, null, 0);
 
     if (body.length > 0) this.socket.write(httpWriter.writeChunk(body));
     if (typeof callback === 'function') callback();
@@ -1129,11 +1184,11 @@ export class ServerResponse extends EventEmitter {
     }
 
     if (this._streaming) {
-      if (!this.headersSent) this._writeHead(true, 0);
+      if (!this.headersSent) this.writeHead(this.statusCode, this.statusMessage, null, 0);
       if (body.length > 0) this.socket.write(httpWriter.writeChunk(body));
       this.socket.write(httpWriter.writeFinalChunk());
     } else {
-      this._writeHead(false, body.length);
+      this.writeHead(this.statusCode, this.statusMessage, null, body.length);
       if (body.length > 0) this.socket.write(body);
     }
 
@@ -1254,7 +1309,7 @@ export class Server extends net.Server {
       }
 
       state.buffered = parsed.consumed < state.buffered.length ? state.buffered.subarray(parsed.consumed) : Buffer.alloc(0);
-
+      
       const req = new IncomingMessage(socket, parsed);
       const res = new ServerResponse(req, socket, state);
       state.activeResponse = res;

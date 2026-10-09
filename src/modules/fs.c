@@ -5228,6 +5228,9 @@ void init_fs_module(ant_t *js) {
   
   js_set_global_builtin(js, "Stats", js_obj_to_func(js, stats_ctor));
 
+  // Stats should also be a builtin and reachable from fs.Stats
+  js->builtins.stats_ctor = js_obj_to_func(js, stats_ctor);
+
   js->builtins.dirent_proto = js_mkobj(js);
   js_set(js, js->builtins.dirent_proto, "isFile", js_mkfun(dirent_isFile));
   js_set(js, js->builtins.dirent_proto, "isDirectory", js_mkfun(dirent_isDirectory));
@@ -5593,6 +5596,7 @@ ant_value_t fs_library(ant_t *js) {
   js_set(js, lib, "FSWatcher", js->builtins.fswatcher_ctor);
   js_set(js, lib, "ReadStream", js->builtins.readstream_ctor);
   js_set(js, lib, "WriteStream", js->builtins.writestream_ctor);
+  js_set(js, lib, "Stats", js->builtins.stats_ctor);
   js_set(js, realpath_sync, "native", realpath_sync);
   
   js_set_getter_desc(
