@@ -246,17 +246,13 @@ ant_value_t string_decoder_decode_value(
 static ant_value_t js_sd_ctor(ant_params_t) {
   ant_value_t encoding = nargs > 0 ? args[0] : js_mkundef();
 
-  // Case 1: Called with `new` (standard instantiation)
   if (!is_undefined(call_new_target)) {
     return string_decoder_create(js, encoding, call_new_target);
   }
 
-  // Case 2: Called via `.call(this, ...)` or standard function call without `new`
-  // Check if `this` is a valid object and doesn't already have the native state
   if (is_object_type(js->this_val)) {
     sd_state_t *st = sd_get_state(js->this_val);
     if (!st) {
-      // Parse encoding
       int enc = SD_ENC_UTF8;
       if (!is_undefined(encoding)) {
         ant_value_t label_val = (vtype(encoding) == kTypeString) ? encoding : coerce_to_str(js, encoding);
@@ -277,7 +273,6 @@ static ant_value_t js_sd_ctor(ant_params_t) {
         if (!st->td) { free(st); return js_mkerr(js, "out of memory"); }
       }
 
-      // Ensure prototype is set correctly for the borrowed `this` context
       ant_value_t proto = js->builtins.string_decoder_proto;
       if (is_object_type(proto)) js_set_proto_init(js->this_val, proto);
       
@@ -287,7 +282,6 @@ static ant_value_t js_sd_ctor(ant_params_t) {
     return js->this_val;
   }
 
-  // Case 3: Called purely as a function `StringDecoder('utf8')` without `new` or `this`
   return string_decoder_create(js, encoding, js_mkundef());
 }
 

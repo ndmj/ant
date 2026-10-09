@@ -5228,7 +5228,6 @@ void init_fs_module(ant_t *js) {
   
   js_set_global_builtin(js, "Stats", js_obj_to_func(js, stats_ctor));
 
-  // Stats should also be a builtin and reachable from fs.Stats
   js->builtins.stats_ctor = js_obj_to_func(js, stats_ctor);
 
   js->builtins.dirent_proto = js_mkobj(js);

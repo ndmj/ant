@@ -915,7 +915,6 @@ export class IncomingMessage extends Readable {
     this.aborted = false;
     this.destroyed = false;
     this.readableEnded = false;
-    // Express (body-parser) depends on _body (true, false) to indicate if already parsed
     this._rawBody = bufferFrom(parsed.body);
     this._bodyConsumed = false;
   }
@@ -992,7 +991,6 @@ export class ServerResponse extends EventEmitter {
     this.writableEnded = false;
     this.writableFinished = false;
     this.finished = false;
-    // Internal field that starts as null and is set to raw header string
     this._header = null;
     this._headers = createHeadersObject();
     this._headerNames = createHeadersObject();
@@ -1051,11 +1049,6 @@ export class ServerResponse extends EventEmitter {
   }
 
   writeHead(statusCode, statusMessage, headers, bodySize) {
-    // Handle Node.js argument overloading:
-    // res.writeHead(statusCode)
-    // res.writeHead(statusCode, headers)
-    // res.writeHead(statusCode, statusMessage)
-    // res.writeHead(statusCode, statusMessage, headers)
     if (typeof statusMessage === 'object' && statusMessage !== null) {
       headers = statusMessage;
       statusMessage = undefined;
@@ -1073,13 +1066,11 @@ export class ServerResponse extends EventEmitter {
 
     let resolvedBodySize = 0;
     if (!this._streaming) {
-      // Determine body size: use passed bodySize, or check Content-Length header, or default to 0
       resolvedBodySize = bodySize !== undefined 
         ? bodySize 
         : (Number(this.getHeader('content-length')) || 0);
     }
 
-    // Now actually write headers to the socket!
     this._writeHead(this._streaming, resolvedBodySize);
 
     return this;
@@ -1108,7 +1099,6 @@ export class ServerResponse extends EventEmitter {
     
     let headerString = `HTTP/1.1 ${statusCode} ${statusMessage}\r\n`;
 
-    // Use Ant's existing _headerNames to get proper casing, fallback to lowercase keys
     const headers = this._headers || {};
     const headerNames = this._headerNames || {};
 
