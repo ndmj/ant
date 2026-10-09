@@ -442,7 +442,7 @@ static inline bool sv_op_call_call_fused(
         .js = js,
         .module_ctx = c1->module_ctx,
         .in_remember_set = 1,
-        .gc_epoch = gc_get_epoch(),
+        .gc_epoch = gc_get_epoch(js),
       };
       fake.upvalues = fake.inline_upvals;
 

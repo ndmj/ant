@@ -9,6 +9,7 @@
 
 #include "silver/call.h"
 #include "modules/symbol.h"
+#include "modules/iterator.h"
 #include "modules/assert.h"
 #include "streams/readable.h"
 #include "streams/pipes.h"
@@ -22,12 +23,6 @@ bool rs_is_reader(ant_value_t obj) {
   return js_check_brand(obj, BRAND_READABLE_STREAM_READER)
     && vtype(js_get_slot(obj, SLOT_RS_CLOSED)) == kTypePromise
     && vtype(js_get_slot(obj, SLOT_AUX)) == kTypeArray;
-}
-
-bool rs_is_controller(ant_value_t obj) {
-  return js_check_brand(obj, BRAND_READABLE_STREAM_CONTROLLER)
-    && rs_get_controller(obj) != NULL
-    && rs_is_stream(js_get_slot(obj, SLOT_ENTRIES));
 }
 
 bool rs_stream_locked(ant_value_t stream_obj) {
@@ -129,6 +124,7 @@ static ant_value_t rs_ctrl_queue_shift(ant_t *js, ant_value_t ctrl_obj) {
   uint32_t new_len = aobj->u.array.len - 1;
   for (uint32_t i = 0; i < new_len; i++)
     aobj->u.array.data[i] = aobj->u.array.data[i + 1];
+  gc_elements_moved(aobj);
   aobj->u.array.len = new_len;
   return val;
 }
@@ -153,6 +149,7 @@ static ant_value_t rs_reader_reqs_shift(ant_t *js, ant_value_t reader_obj) {
   uint32_t new_len = aobj->u.array.len - 1;
   for (uint32_t i = 0; i < new_len; i++)
     aobj->u.array.data[i] = aobj->u.array.data[i + 1];
+  gc_elements_moved(aobj);
   aobj->u.array.len = new_len;
   return val;
 }
@@ -963,7 +960,7 @@ void init_readable_stream_module(ant_t *js) {
   js_set_descriptor(js, js->builtins.controller_proto, "enqueue", 7, JS_DESC_W | JS_DESC_C);
   js_set(js, js->builtins.controller_proto, "error", js_mkfun(js_rs_controller_error));
   js_set_descriptor(js, js->builtins.controller_proto, "error", 5, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.controller_proto, get_toStringTag_sym(), js_mkstr(js, "ReadableStreamDefaultController", 31));
+  js_set_sym(js, js->builtins.controller_proto, js->sym.toStringTag_sym, js_mkstr(js, "ReadableStreamDefaultController", 31));
 
   ant_value_t ctrl_ctor = js_make_ctor(js, js_rs_controller_ctor, js->builtins.controller_proto, "ReadableStreamDefaultController", 31);
   js_set(js, g, "ReadableStreamDefaultController", ctrl_ctor);
@@ -977,7 +974,7 @@ void init_readable_stream_module(ant_t *js) {
   js_set_descriptor(js, js->builtins.reader_proto, "releaseLock", 11, JS_DESC_W | JS_DESC_C);
   js_set(js, js->builtins.reader_proto, "cancel", js_mkfun(js_rs_reader_cancel));
   js_set_descriptor(js, js->builtins.reader_proto, "cancel", 6, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.reader_proto, get_toStringTag_sym(), js_mkstr(js, "ReadableStreamDefaultReader", 27));
+  js_set_sym(js, js->builtins.reader_proto, js->sym.toStringTag_sym, js_mkstr(js, "ReadableStreamDefaultReader", 27));
 
   ant_value_t reader_ctor = js_make_ctor(js, js_rs_reader_ctor, js->builtins.reader_proto, "ReadableStreamDefaultReader", 27);
   js_set(js, g, "ReadableStreamDefaultReader", reader_ctor);
@@ -988,7 +985,7 @@ void init_readable_stream_module(ant_t *js) {
   js_set_descriptor(js, js->builtins.rs_async_iter_proto, "next", 4, JS_DESC_W | JS_DESC_C);
   js_set(js, js->builtins.rs_async_iter_proto, "return", js_mkfun(js_rs_async_iter_return));
   js_set_descriptor(js, js->builtins.rs_async_iter_proto, "return", 6, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.rs_async_iter_proto, get_asyncIterator_sym(), js_mkfun(sym_this_cb));
+  js_set_sym(js, js->builtins.rs_async_iter_proto, js->sym.asyncIterator_sym, js_mkfun(sym_this_cb));
 
   js->builtins.rs_proto = js_mkobj(js);
   js_set_getter_desc(js, js->builtins.rs_proto, "locked", 6, js_mkfun(js_rs_get_locked), JS_DESC_C);
@@ -1000,8 +997,8 @@ void init_readable_stream_module(ant_t *js) {
   
   js_set(js, js->builtins.rs_proto, "values", js_mkfun(js_rs_values));
   js_set_descriptor(js, js->builtins.rs_proto, "values", 6, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.rs_proto, get_asyncIterator_sym(), js_get(js, js->builtins.rs_proto, "values"));
-  js_set_sym(js, js->builtins.rs_proto, get_toStringTag_sym(), js_mkstr(js, "ReadableStream", 14));
+  js_set_sym(js, js->builtins.rs_proto, js->sym.asyncIterator_sym, js_get(js, js->builtins.rs_proto, "values"));
+  js_set_sym(js, js->builtins.rs_proto, js->sym.toStringTag_sym, js_mkstr(js, "ReadableStream", 14));
 
   ant_value_t rs_ctor = js_make_ctor(js, js_rs_ctor, js->builtins.rs_proto, "ReadableStream", 14);
   js_set(js, g, "ReadableStream", rs_ctor);

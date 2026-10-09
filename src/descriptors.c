@@ -22,6 +22,20 @@ static descriptor_entry_t arr_length_desc = {
   .setter = 0,
 };
 
+static descriptor_entry_t arr_length_readonly_desc = {
+  .key = 0,
+  .obj_off = 0,
+  .prop_name = "length",
+  .prop_len = 6,
+  .writable = false,
+  .enumerable = false,
+  .configurable = false,
+  .has_getter = false,
+  .has_setter = false,
+  .getter = 0,
+  .setter = 0,
+};
+
 static inline bool is_canonical_desc_obj(ant_value_t obj) {
   return vtype(obj) == kTypeObject;
 }
@@ -94,12 +108,19 @@ descriptor_entry_t *lookup_descriptor(ant_t *js, ant_value_t obj, const char *ke
   if (!js || !is_canonical_desc_obj(obj)) return NULL;
 
   ant_object_t *ptr = js_obj_ptr(obj);
-  if (klen == 6 && memcmp(key, "length", 6) == 0 && ptr && ptr->type_tag == kTypeArray)
-    return &arr_length_desc;
+  if (
+    klen == 6 && memcmp(key, "length", 6) == 0 && ptr && 
+    ptr->type_tag == kTypeArray && !ptr->flags.arguments_object
+  ) {
+    if (ptr->flags.frozen) return &arr_length_readonly_desc;
+    descriptor_entry_t *own = ptr->flags.is_exotic ? registry_lookup_desc(js, obj, key, klen) : NULL;
+    return own ? own : &arr_length_desc;
+  }
 
   if (!is_exotic_desc_obj(obj)) return NULL;
   return registry_lookup_desc(js, obj, key, klen);
 }
+
 
 descriptor_entry_t *lookup_sym_descriptor(ant_t *js, ant_value_t obj, ant_offset_t sym_off) {
   assert(js && is_canonical_desc_obj(obj) && "lookup_sym_descriptor expects an isolate and js_as_obj(...)");
@@ -168,8 +189,8 @@ static bool ensure_string_shape_slot(ant_t *js, ant_value_t obj, const char *key
   int32_t slot = ant_shape_lookup_interned(ptr->shape, interned);
   if (slot < 0) {
     uint32_t added_slot = 0;
-    if (!ant_shape_add_interned_tr(&ptr->shape, interned, ANT_PROP_ATTR_DEFAULT, &added_slot)) return false;
-    ant_object_invalidate_guarded_absence(ptr);
+    if (!ant_shape_add_interned_tr(js, &ptr->shape, interned, ANT_PROP_ATTR_DEFAULT, &added_slot)) return false;
+    ant_object_invalidate_guarded_absence(js, ptr);
     if (!ensure_added_shape_slot_storage(ptr, added_slot)) return false;
     slot = (int32_t)added_slot;
   }
@@ -273,7 +294,7 @@ void js_set_descriptor(ant_t *js, ant_value_t obj, const char *key, size_t klen,
       false, false, js_mkundef()
     );
 
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     return;
   }
 
@@ -302,7 +323,7 @@ void js_set_sym_descriptor(ant_t *js, ant_value_t obj, ant_value_t sym, int flag
     );
 
     ant_symbol_property_mutation_invalidate(js, js_obj_ptr(obj), sym_off);
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     return;
   }
 
@@ -334,7 +355,7 @@ void js_set_getter_desc(ant_t *js, ant_value_t obj, const char *key, size_t klen
       prop->key.interned
     );
 
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     gc_write_barrier(js, js_obj_ptr(js_as_obj(obj)), getter);
 
     return;
@@ -368,7 +389,7 @@ void js_set_setter_desc(ant_t *js, ant_value_t obj, const char *key, size_t klen
       prop->key.interned
     );
 
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     gc_write_barrier(js, js_obj_ptr(js_as_obj(obj)), setter);
 
     return;
@@ -402,7 +423,7 @@ void js_set_accessor_desc(ant_t *js, ant_value_t obj, const char *key, size_t kl
       prop->key.interned
     );
 
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     gc_write_barrier(js, js_obj_ptr(js_as_obj(obj)), getter);
     gc_write_barrier(js, js_obj_ptr(js_as_obj(obj)), setter);
 
@@ -436,7 +457,7 @@ void js_set_sym_getter_desc(ant_t *js, ant_value_t obj, ant_value_t sym, ant_val
     );
 
     ant_symbol_property_mutation_invalidate(js, js_obj_ptr(obj), sym_off);
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     gc_write_barrier(js, js_obj_ptr(js_as_obj(obj)), getter);
 
     return;
@@ -469,7 +490,7 @@ void js_set_sym_setter_desc(ant_t *js, ant_value_t obj, ant_value_t sym, ant_val
     );
 
     ant_symbol_property_mutation_invalidate(js, js_obj_ptr(obj), sym_off);
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     gc_write_barrier(js, js_obj_ptr(js_as_obj(obj)), setter);
 
     return;
@@ -493,4 +514,21 @@ void js_descriptor_registry_cleanup(ant_t *js) {
     HASH_DEL(js->desc_registry, entry);
     free(entry);
   }
+}
+
+bool js_array_make_length_readonly(ant_t *js, ant_value_t arr) {
+  ant_value_t obj = js_as_obj(arr);
+  ant_object_t *ptr = js_obj_ptr(obj);
+  if (!ptr || ptr->type_tag != kTypeArray) return false;
+  
+  ptr->flags.is_exotic = 1;
+  descriptor_entry_t *entry = get_or_create_desc(js, obj, "length", 6);
+  if (!entry) return false;
+  
+  entry->writable = false;
+  entry->enumerable = false;
+  entry->configurable = false;
+  ant_ic_epoch_bump(js);
+  
+  return true;
 }

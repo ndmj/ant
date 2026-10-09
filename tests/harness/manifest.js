@@ -1,4 +1,4 @@
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 
 const SPEC_SKIP = new Set(['run.js', 'helpers.js']);
 const SPEC_MANUAL = new Set([]);
@@ -132,13 +132,58 @@ export function targets() {
     'test_generator_open_upvalue_gc.cjs',
     'test_gc_template_const_cache.cjs',
     'test_jit_literal_template_minor_gc.cjs',
+    'test_gc_array_cards.cjs',
+    'test_poly_field_ic.cjs',
+    'test_ic_read_differential.cjs',
+    'test_poly_field_store.cjs',
+    'test_code_unit_minor.cjs',
+    'test_jit_strict_mode.cjs',
+    'test_jit_define_slot.cjs',
+    'test_new_prototype_cache.cjs',
+    'test_jit_new_direct.cjs',
+    'test_jit_store_barrier.cjs',
+    'test_jit_element_barrier.cjs',
+    'test_array_inherited_index.cjs',
+    'test_jit_string_builtins.cjs',
+    'test_jit_neg_infinity_receiver.cjs',
+    'test_jit_math_intrinsics.cjs',
+    'test_jit_compare_branch.cjs',
+    'test_jit_loop_hoisting.cjs',
+    'test_jit_loop_hoisting_codegen.cjs',
+    'test_for_update_tonumeric.cjs',
+    'test_jit_induction_locals.cjs',
+    'test_jit_induction_locals_codegen.cjs',
+    'test_jit_captured_local_init.cjs',
+    'test_jit_param_counters.cjs',
+    'test_jit_param_counters_codegen.cjs',
+    'test_jit_bitwise_primitives.cjs',
+    'test_numeric_coercion_errors.cjs',
+    'test_array_storage_reuse.cjs',
+    'test_jit_proto_method_snapshot.cjs',
+    'test_jit_global_snapshot.cjs',
+    'test_jit_snapshot_recovery.cjs',
+    'test_arguments_object_semantics.cjs',
+    'test_array_builtin_fast_paths.cjs',
+    'test_gc_native_buffers.cjs',
+    'test_immediate_handle.cjs',
+    'test_timer_handle.cjs',
+    'test_process_exit_code.cjs',
+    'test_unhandled_rejection_exit.cjs',
+    'test_array_readonly_length.cjs',
+    'test_duplicate_declarations.cjs',
+    'test_arguments_define_mapped.cjs',
+    'test_jit_uninitialized_numeric_local.cjs',
+    'test_using_identifier.cjs',
     'test_regexp_lone_surrogates.cjs',
     'test_json_lone_surrogates.cjs',
     'test_timer_fired_timeout_gc.cjs',
     'test_uv_nested_poll.mjs',
     'tagged_templates.cjs',
     'test_string_number_concat.cjs',
-    'test_jit_short_concat_copy.cjs'
+    'test_jit_short_concat_copy.cjs',
+    'test_arguments_length_only.cjs',
+    'test_events_listener_storage.cjs',
+    'test_jit_builtin_direct_call.cjs'
   ];
   for (const f of REGRESSION_TESTS) list.push({ group: 'tests', type: 'test', name: `tests/${f}`, entry: `tests/${f}` });
 
@@ -162,7 +207,8 @@ export function targets() {
     ['test_promise_resolution_fastpaths.mjs', 48],
     ['test_tla_repeated_await.mjs', 48],
     ['test_upvalue_gc.cjs', 384],
-    ['test_gc_closure_churn.cjs', 96]
+    ['test_gc_closure_churn.cjs', 96],
+    ['test_dynamic_code_reclaim.cjs', 64]
   ];
   for (const [f, maxRssMb] of ASYNC_TESTS) list.push({ group: 'async', type: 'test', name: `tests/${f}`, entry: `tests/${f}`, mem: true, maxRssMb });
 
@@ -323,6 +369,22 @@ export function targets() {
       ]
     }
   );
+
+  // React SSR through a request loop without I/O; needs `ant install` in
+  // tests/bench_ssr, since the harness doesn't install dependencies
+  list.push(existsSync('tests/bench_ssr/node_modules/react-dom')
+    ? {
+        group: 'perf',
+        type: 'demo',
+        name: 'bench_ssr',
+        entry: 'tests/bench_ssr/main.js',
+        checks: [
+          { name: 'rendered body', re: /@(\d+) <h1>Hello, world!<\/h1>/, min: 10000, max: 100000 },
+          { name: 'completed requests', re: /@(\d+) <h1>Hello, world!<\/h1>\ndone/, min: 100000, max: 100000 },
+          ms('time ms', /time: ([\d.]+) ms/, 200, 10000)
+        ]
+      }
+    : { group: 'perf', type: 'skip', name: 'bench_ssr', reason: 'run ant install in tests/bench_ssr' });
 
   list.push(
     {

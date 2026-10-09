@@ -110,6 +110,7 @@ enum {
   FN_CLASS_DECL       = 1 << 18,
   FN_CLASS_CTOR       = 1 << 19,
   FN_YIELD_STAR       = 1 << 20,
+  FN_ARGS_LENGTH_ONLY = 1 << 21,
 };
 
 enum {
@@ -161,16 +162,35 @@ struct sv_ast {
   uint32_t        src_end;
 };
 
-bool sv_ast_list_push(sv_ast_list_t *list, sv_ast_t *node);
+bool sv_ast_list_push(ant_t *js, sv_ast_list_t *list, sv_ast_t *node);
 bool sv_ast_can_be_expression_statement(const sv_ast_t *node);
 bool ast_references_arguments(const sv_ast_t *node);
+bool ast_is_arguments_length(const sv_ast_t *node);
 bool ast_references_new_target(const sv_ast_t *node);
 bool ast_contains_direct_eval(const sv_ast_t *node);
 bool ast_contains_lexical_new_target(const sv_ast_t *node);
 bool ast_contains_direct_suspend(const sv_ast_t *node, const sv_ast_t **out_offender);
 bool ast_contains_own_yield(const sv_ast_t *node, const sv_ast_t **out_offender);
+bool ast_pattern_binds(const sv_ast_t *node, const char *name);
 
-sv_ast_t *sv_ast_new(sv_node_type_t type);
-sv_ast_t *sv_parse(ant_t *js, const char *code, ant_offset_t clen, bool strict);
+typedef enum {
+  SV_PARSE_SCRIPT,
+  SV_PARSE_MODULE,
+  SV_PARSE_REPL,
+  SV_PARSE_DETECT,
+} sv_parse_goal_t;
+
+typedef struct {
+  const char *text;
+  ant_offset_t len;
+  ant_offset_t params_off, params_end;
+  ant_offset_t body_off, body_end;
+  bool is_async;
+  bool is_generator;
+} sv_function_parts_t;
+
+sv_ast_t *sv_ast_new(ant_t *js, sv_node_type_t type);
+sv_ast_t *sv_parse_function_parts(ant_t *js, const sv_function_parts_t *parts);
+sv_ast_t *sv_parse(ant_t *js, const char *code, ant_offset_t clen, sv_parse_goal_t goal, bool strict);
 
 #endif

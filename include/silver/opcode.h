@@ -281,7 +281,7 @@ OP_DEF(  WITH_GET_CALL,     8,   0,   2, atom)      /* -> receiver, val for iden
 OP_DEF(  WITH_PUT_VAR,      8,   1,   0, atom)      /* val -> (check with-obj then fallback) */
 OP_DEF(  WITH_DEL_VAR,      5,   0,   1, atom)      /* -> bool (delete from with-obj/global) */
 
-OP_DEF(  SPECIAL_OBJ,       2,   0,   1, u8)        /* arguments, new.target, super, module import */
+OP_DEF(  SPECIAL_OBJ,       2,   0,   1, u8)        /* arguments, new.target, super, module import, arguments.length */
 OP_DEF(  EMPTY,             1,   0,   1, none)      /* push T_EMPTY (array hole) */
 OP_DEF(  DEBUGGER,          1,   0,   0, none)      /* debugger statement (breakpoint hook) */
 OP_DEF(  NOP,               1,   0,   0, none)      /* no operation */
@@ -297,6 +297,7 @@ OP_DEF(  INIT_EVAL_ENV,     1,   0,   0, none)
 OP_DEF(  CLOSURE_EVAL,      9,   0,   1, u32)
 OP_DEF(  PUT_EVAL_FUNCTION, 5,   1,   0, atom)
 OP_DEF(  INIT_GLOBAL_LEX,   5,   1,   0, atom)
+OP_DEF(  CLOSURE_ARGS,      5,   0,   1, const)     /* closure in a function with mapped arguments: link captured params */
 #undef OP_DEF
 #undef op_def
 #endif
@@ -386,8 +387,8 @@ OP_FLAG(INC                   , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT |
 OP_FLAG(DEC                   , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_JIT_NEEDS_INC_LOCAL)
 OP_FLAG(POST_INC              , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_JIT_NEEDS_INC_LOCAL)
 OP_FLAG(POST_DEC              , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_JIT_NEEDS_INC_LOCAL)
-OP_FLAG(INC_LOCAL             , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_INC_LOCAL)
-OP_FLAG(DEC_LOCAL             , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_INC_LOCAL)
+OP_FLAG(INC_LOCAL             , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_JIT_NEEDS_INC_LOCAL)
+OP_FLAG(DEC_LOCAL             , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_JIT_NEEDS_INC_LOCAL)
 OP_FLAG(ADD_LOCAL             , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT)
 OP_FLAG(STR_APPEND_LOCAL      , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_BUILDER_TARGET)
 OP_FLAG(STR_ALC_SNAPSHOT      , SV_OPF_JIT_ELIGIBLE | SV_OPF_JIT_NEEDS_BAILOUT | SV_OPF_BUILDER_TARGET)

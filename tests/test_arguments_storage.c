@@ -3,6 +3,7 @@
 #include "silver/engine.h"
 #include "gc/roots.h"
 #include "modules/symbol.h"
+#include "modules/iterator.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -13,8 +14,10 @@ int main(void) {
   assert(ant_object_flag_masks_match_layout());
   sv_frame_t empty_frame = {0};
   ant_value_t early = js_create_arguments_object(js, js->vm, js_mkundef(), &empty_frame, 0, 0, true);
-  assert(!is_err(early) && js_get_slot(early, SLOT_STRICT_ARGS) == js_true);
+  assert(!is_err(early) && js_get_slot(early, SLOT_ARGUMENTS_OBJECT) == js_true);
   init_symbol_module(js);
+  init_intrinsic_symbols(js);
+  init_iterator_module(js);
   const uint32_t counts[] = {0, 1, 2, 7, 8, 9, 33};
   ant_value_t values[33];
   for (uint32_t i = 0; i < 33; i++) values[i] = js_mknum(i);
@@ -30,8 +33,8 @@ int main(void) {
     uint32_t capacity = count ? count : 1;
     assert(ptr->u.array.cap == capacity && ptr->u.array.len == count);
     assert(js->alloc_bytes.arrays - before == capacity * sizeof(ant_value_t));
-    assert(ptr->extra_slots == NULL && ptr->flags.strict_arguments);
-    assert(js_get_slot(args, SLOT_STRICT_ARGS) == js_true);
+    assert(ptr->extra_slots == NULL && ptr->flags.arguments_object);
+    assert(js_get_slot(args, SLOT_ARGUMENTS_OBJECT) == js_true);
     for (uint32_t i = 0; i < count; i++) assert(js_arr_get(js, args, i) == values[i]);
     js_arr_push(js, args, js_mknum(99));
     assert(js_arr_get(js, args, count) == js_mknum(99));
@@ -39,10 +42,10 @@ int main(void) {
 
     // Preserve the internal slot API for non-marker values as well.
     ant_value_t payload = js_mkobj(js);
-    js_set_slot_wb(js, args, SLOT_STRICT_ARGS, payload);
-    assert(js_get_slot(args, SLOT_STRICT_ARGS) == payload);
-    js_set_slot(args, SLOT_STRICT_ARGS, js_true);
-    assert(js_get_slot(args, SLOT_STRICT_ARGS) == js_true);
+    js_set_slot_wb(js, args, SLOT_ARGUMENTS_OBJECT, payload);
+    assert(js_get_slot(args, SLOT_ARGUMENTS_OBJECT) == payload);
+    js_set_slot(args, SLOT_ARGUMENTS_OBJECT, js_true);
+    assert(js_get_slot(args, SLOT_ARGUMENTS_OBJECT) == js_true);
     GC_ROOT_RESTORE(js, roots);
   }
   js_destroy(js);

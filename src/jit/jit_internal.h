@@ -25,6 +25,9 @@ static constexpr int64_t JIT_COLD_PROMOTE_COMPILE_MULTIPLE = 20;
 static constexpr int64_t JIT_COLD_PROMOTE_CHECK_EVERY = 4096;
 
 static constexpr uint32_t JIT_HOT_COMPILE_BACKEDGE_THRESHOLD = SV_JIT_OSR_THRESHOLD / 8;
+static constexpr uint8_t JIT_SNAPSHOT_RESET_LIMIT = 3;
+
+extern _Thread_local sv_func_t *jit_compile_owner;
 
 typedef struct {
   MIR_context_t ctx;
@@ -44,6 +47,15 @@ typedef struct {
   bool known;
 } jit_integer_range_t;
 
+typedef enum: uint8_t {
+  JIT_BUILTIN_UNKNOWN = 0,
+  JIT_BUILTIN_ARRAY_PUSH,
+  JIT_BUILTIN_NUMBER_TO_STRING,
+  JIT_BUILTIN_STRING,
+  JIT_BUILTIN_MATH,
+  JIT_BUILTIN_MATH_FN,
+} jit_known_builtin_t;
+
 typedef struct {
   MIR_reg_t *regs, *d_regs;
   sv_func_t **known_func;
@@ -51,6 +63,7 @@ typedef struct {
   uint64_t *known_const;
   bool *has_const;
   uint8_t *known_bool;
+  uint8_t *known_builtin;
   jit_integer_range_t *integer_range;
   int sp, max;
   bool overflow;
@@ -61,6 +74,7 @@ typedef struct {
   uint64_t known_const;
   bool has_const;
   uint8_t known_bool;
+  uint8_t known_builtin;
   jit_integer_range_t integer_range;
 } jit_value_info_t;
 
@@ -112,7 +126,7 @@ typedef enum {
 } jit_child_kind_t;
 #define JIT_INLINE_MAX_BYTECODE 192
 typedef struct {
-  MIR_item_t helper1_proto, imp_get_length_inline;
+  MIR_item_t helper1_proto, get_length_proto, imp_get_length_inline;
   MIR_item_t object_proto, imp_object;
   MIR_item_t truthy_proto, imp_is_truthy;
   MIR_item_t imp_get_field, imp_get_length;
@@ -122,14 +136,35 @@ typedef struct {
   MIR_item_t remember_obj_proto, imp_remember_obj;
   MIR_item_t call_proto, imp_call;
   MIR_item_t call_method_proto, imp_call_method;
+  MIR_item_t cfunc_proto, native_finish_proto, imp_native_finish;
   MIR_item_t stable_load_proto, imp_load_stable_builtin;
   MIR_item_t stable_call_proto, imp_call_stable_builtin;
   MIR_item_t imp_band, imp_bor, imp_bxor, imp_shl, imp_shr, imp_ushr;
   MIR_item_t self_proto;
+  MIR_item_t math1_proto, math2_proto;
+  MIR_item_t const *imp_math;
   MIR_reg_t r_args_buf;
   int *next_inline_id;
   bool reader_only;
 } jit_inline_ext_t;
+
+void mir_emit_drop_owner_code_once(
+  MIR_context_t ctx, MIR_item_t fn, ant_t *js, const char *prefix, int site,
+  uint8_t *mark, uint8_t mark_bit, bool count_snapshot_reset
+);
+
+void mir_emit_builtin_call_watch(
+  MIR_context_t ctx, MIR_item_t fn, ant_t *js, const char *prefix, int site,
+  MIR_reg_t r_tmp, MIR_reg_t func, sv_func_t *feedback_func, int bc_off
+);
+
+void mir_emit_builtin_call_fast(
+  MIR_context_t ctx, MIR_item_t fn, const char *prefix, int site,
+  MIR_reg_t r_js, MIR_reg_t r_tmp,
+  MIR_item_t cfunc_proto, MIR_item_t native_finish_proto, MIR_item_t imp_native_finish,
+  MIR_reg_t func, MIR_reg_t this_val, MIR_reg_t args, uint16_t argc,
+  MIR_reg_t result, MIR_label_t generic, MIR_label_t done
+);
 #define INL_MAX_LABELS 128
 typedef struct {
   int bc_off;
@@ -161,6 +196,10 @@ MIR_reg_t vstack_top(jit_vstack_t *vs);
 jit_integer_range_t jit_word_range(sv_op_t op, jit_integer_range_t left, jit_integer_range_t right);
 void jit_emit_integer_constant(
     MIR_context_t ctx, MIR_item_t fn, jit_vstack_t *vs, MIR_reg_t dst, double number);
+enum { JIT_INDUCTION_SIGNED = 1, JIT_INDUCTION_NONNEG = 2 };
+static constexpr int64_t JIT_COUNTER_MAX = INT64_C(0x7ffffffffffffc00);
+void jit_induction_locals(sv_func_t *func, uint8_t *kinds, int n_locals, int param_count);
+uint8_t jit_induction_params(sv_func_t *func, int param_count);
 void jit_entry_integer_ranges(
     sv_func_t *func, jit_integer_range_t *ranges,
     int n_locals, int param_count);
@@ -189,10 +228,10 @@ void mir_d_to_i64(MIR_context_t ctx, MIR_item_t fn,
                   MIR_reg_t dst_i64, MIR_reg_t src_d,
                   MIR_reg_t slot);
 void mir_emit_get_length(
-    MIR_context_t ctx, MIR_item_t fn,
+    MIR_context_t ctx, MIR_item_t fn, ant_t *js,
     MIR_reg_t obj, MIR_reg_t dst,
-    MIR_reg_t r_vm, MIR_reg_t r_js, MIR_reg_t r_d_slot,
-    MIR_item_t helper1_proto, MIR_item_t imp_get_length,
+    MIR_reg_t r_js, MIR_reg_t r_d_slot,
+    MIR_item_t get_length_proto, MIR_item_t imp_get_length,
     bool builder_slot,
     int owner_id, int bc_off);
 void mir_emit_slot_boxed(MIR_context_t ctx, MIR_item_t fn,
@@ -268,6 +307,7 @@ void mir_emit_close_marked_slots(
 void mir_emit_upval_write_barrier(
     MIR_context_t ctx, MIR_item_t jit_func,
     MIR_item_t upval_barrier_proto, MIR_item_t imp_upval_barrier,
+    MIR_item_t imp_upval_flagged,
     MIR_reg_t r_js, MIR_reg_t r_uv, MIR_reg_t src, int un);
 void mir_emit_exit_ret(
     MIR_context_t ctx, MIR_item_t fn,
@@ -329,10 +369,28 @@ typedef enum {
   JIT_ELEMENT_READ,
   JIT_ELEMENT_WRITE,
 } jit_element_access_t;
+typedef struct {
+  MIR_label_t past_end;
+  MIR_reg_t ptr, flags, len;
+} jit_dense_element_t;
+typedef struct {
+  ant_math_intrinsic_t kind;
+  MIR_reg_t result, callee, a, b;
+  MIR_reg_t r_js, r_d_slot, scratch;
+  MIR_item_t math1_proto, math2_proto;
+  MIR_item_t const *imp_math;
+  int site;
+} jit_math_call_t;
+MIR_label_t mir_emit_math_call(MIR_context_t ctx, MIR_item_t fn, const jit_math_call_t *call);
+uint8_t jit_math_field_builtin(uint8_t receiver, const char *name, uint32_t len);
+void mir_emit_array_add_guard(
+    MIR_context_t ctx, MIR_item_t fn, MIR_reg_t r_js,
+    MIR_reg_t ptr, MIR_reg_t flags, MIR_label_t slow, int site);
 MIR_reg_t mir_emit_dense_element_guard(
     MIR_context_t ctx, MIR_item_t fn,
     MIR_reg_t object, MIR_reg_t index, MIR_reg_t value,
-    jit_element_access_t access, MIR_label_t slow, int site);
+    jit_element_access_t access, MIR_label_t slow, int site,
+    jit_dense_element_t *element);
 void mir_emit_word32_binary(
     MIR_context_t ctx, MIR_item_t fn, sv_op_t op,
     MIR_reg_t left, MIR_reg_t right, MIR_reg_t result,
@@ -395,7 +453,7 @@ void mir_emit_value_to_objptr_or_jmp(
     MIR_reg_t v, MIR_reg_t out_ptr,
     MIR_reg_t r_tag, MIR_label_t slow);
 void mir_emit_ic_obj_epoch_guard(
-    MIR_context_t ctx, MIR_item_t fn,
+    ant_t *js, MIR_context_t ctx, MIR_item_t fn,
     MIR_reg_t ic, MIR_label_t slow,
     const char *prefix, int bc_off, uint16_t ic_idx);
 void mir_emit_string_concat_fastpath(
@@ -423,7 +481,7 @@ bool mir_emit_get_field_ic_fastpath(
     MIR_reg_t r_global_epoch);
 bool mir_emit_get_global_ic_fastpath(
     MIR_context_t ctx, MIR_item_t fn,
-    sv_func_t *func, int bc_off,
+    ant_t *js, sv_func_t *func, int bc_off,
     MIR_reg_t r_js, MIR_reg_t dst,
     MIR_label_t slow, MIR_reg_t r_global_epoch,
     uint8_t *ip);
@@ -434,6 +492,7 @@ bool *scan_captured_locals(sv_func_t *func, int n_locals);
 bool *scan_captured_params(sv_func_t *func);
 bool jit_inlineable(sv_func_t *f);
 bool jit_can_forward_arguments(sv_func_t *func);
+bool jit_numeric_param_use(sv_func_t *func, uint8_t *ip, uint8_t *end);
 bool jit_has_immediate_numeric_local_init(sv_func_t *func, uint8_t *ip, uint8_t *end, uint16_t local_idx);
 void jit_emit_inline_body(
     MIR_context_t ctx, MIR_item_t jit_func, ant_t *js,

@@ -6,7 +6,6 @@
 #include "internal.h"
 
 #include "gc/roots.h"
-#include "modules/symbol.h"
 #include "silver/engine.h"
 #include "silver/eval_env.h"
 
@@ -98,7 +97,7 @@ static bool inspector_append_function_description(ant_t *js, ant_value_t value, 
 static const char *inspector_object_tag(ant_t *js, ant_value_t value, size_t *len) {
   if (len) *len = 0;
   if (!js || !inspector_is_remote_handle_value(value)) return NULL;
-  ant_value_t tag = js_get_sym(js, value, get_toStringTag_sym());
+  ant_value_t tag = js_get_sym(js, value, js->sym.toStringTag_sym);
   if (vtype(tag) != kTypeString) return NULL;
   return js_getstr(js, tag, len);
 }
@@ -395,14 +394,14 @@ bool inspector_value_to_remote_object(ant_t *js, ant_value_t value, sbuf_t *out)
 bool inspector_append_call_location(ant_t *js, sbuf_t *b) {
   if (!js || !b) return true;
 
-  js_error_site_t saved = js->errsite;
+  js_error_site_t saved = js_error_site_save(js);
   js_clear_error_site(js);
 
   const char *filename = NULL;
   int line = 1;
   int column = 1;
   js_get_call_location(js, &filename, &line, &column);
-  js->errsite = saved;
+  js_error_site_restore(js, &saved);
 
   if (!filename || !*filename) return true;
   char *url = inspector_make_script_url(filename);
@@ -527,7 +526,7 @@ static size_t inspector_heap_used(ant_t *js) {
     js->closure_arena.live_count * js->closure_arena.elem_size +
     js->upvalue_arena.live_count * js->upvalue_arena.elem_size +
     strings.total.used + ropes.used + symbols.used + permanent.used + bigints.used +
-    code_arena_get_memory() + parse_arena_get_memory();
+    code_arena_get_memory(js) + parse_arena_get_memory(js);
 }
 
 static size_t inspector_heap_total(ant_t *js) {
@@ -542,7 +541,7 @@ static size_t inspector_heap_total(ant_t *js) {
     js->closure_arena.committed +
     js->upvalue_arena.committed +
     strings.total.capacity + ropes.capacity + symbols.capacity + permanent.capacity + bigints.capacity +
-    code_arena_get_memory() + parse_arena_get_memory();
+    code_arena_get_memory(js) + parse_arena_get_memory(js);
 }
 
 void inspector_send_execution_context(inspector_client_t *client) {

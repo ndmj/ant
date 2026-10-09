@@ -15,7 +15,6 @@
 #include "gc/modules.h"
 #include "modules/buffer.h"
 #include "modules/atomics.h"
-#include "modules/symbol.h"
 #include "modules/timer.h"
 
 typedef enum {
@@ -176,21 +175,6 @@ static int async_waiter_notify(int32_t *address, int count) {
   }
 
   return notified;
-}
-
-void wait_queue_cleanup(WaitQueue *queue) {
-  pthread_mutex_lock(&queue->lock);
-  WaitQueueEntry *current = queue->head;
-  while (current) {
-    WaitQueueEntry *next = current->next;
-    pthread_cond_destroy(&current->cond);
-    pthread_mutex_destroy(&current->mutex);
-    free(current);
-    current = next;
-  }
-  queue->head = NULL;
-  pthread_mutex_unlock(&queue->lock);
-  pthread_mutex_destroy(&queue->lock);
 }
 
 void wait_queue_add(WaitQueue *queue, WaitQueueEntry *entry) {
@@ -1061,7 +1045,7 @@ void init_atomics_module(ant_t *js) {
   js_set(js, atomics, "waitAsync", js_mkfun(js_atomics_waitAsync));
   js_set(js, atomics, "xor", js_mkfun(js_atomics_xor));
   
-  js_set_sym(js, atomics, get_toStringTag_sym(), js_mkstr(js, "Atomics", 7));
+  js_set_sym(js, atomics, js->sym.toStringTag_sym, js_mkstr(js, "Atomics", 7));
   js_set_global_builtin(js, "Atomics", atomics);
 }
 

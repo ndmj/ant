@@ -23,8 +23,20 @@ static inline ant_value_t sv_invoke_native(
   ant_t *js, ant_cfunc_t fn, ant_value_t *args,
   int nargs, ant_value_t new_target
 ) {
-  if (__builtin_expect(Ant_Exception_Pending(js) || gc_value_is_heap_ref(new_target), 0))
+  if (__builtin_expect(Ant_Exception_Pending(js), 0))
     return Ant_Silver_InvokeNativeScoped(js, fn, args, nargs, new_target);
+
+  sv_vm_t *vm = js->vm;
+  if (gc_value_is_heap_ref(new_target) && vm) {
+    sv_native_frame_t frame = { .caller = vm->native_frame, .new_target = new_target };
+    vm->native_frame = &frame;
+    
+    ant_value_t result = fn(js, args, nargs, new_target);
+    vm->native_frame = frame.caller;
+    
+    return Ant_Silver_FinishNativeCall(js, result);
+  }
+
   ant_value_t result = fn(js, args, nargs, new_target);
   return Ant_Silver_FinishNativeCall(js, result);
 }
@@ -106,6 +118,45 @@ static inline ant_value_t sv_construct_prototype_from_object(
 
   return (is_err(proto) || is_object_type(proto))
     ? proto : js->sym.object_proto;
+}
+
+static inline bool sv_construct_prototype_data(
+  ant_t *js, ant_object_t *ptr, sv_func_t *func, ant_value_t *out
+) {
+  sv_func_sidecar_t *sidecar = func ? sv_func_sidecar(func) : NULL;
+  if (!sidecar || !ptr || ptr->flags.is_exotic || !ptr->shape) return false;
+
+  if (ptr->shape != sidecar->ctor_proto_shape) {
+    int32_t found = ant_shape_lookup_interned(ptr->shape, js->intern.prototype);
+    if (found < 0 || (uint32_t)found >= ptr->prop_count) return false;
+    
+    const ant_shape_prop_t *prop = ant_shape_prop_at(ptr->shape, (uint32_t)found);
+    if (!prop || prop->has_getter || prop->has_setter) return false;
+
+    if (!sidecar->ctor_proto_shape_registered) {
+      if (!func->unit && !sv_ic_shape_ref_register(js, &sidecar->ctor_proto_shape)) return false;
+      sidecar->ctor_proto_shape_registered = true;
+    }
+    
+    ant_shape_retain(ptr->shape);
+    if (sidecar->ctor_proto_shape) ant_shape_release(sidecar->ctor_proto_shape);
+    
+    sidecar->ctor_proto_shape = ptr->shape;
+    sidecar->ctor_proto_slot = (uint32_t)found;
+  }
+
+  ant_value_t proto = ant_object_prop_get_unchecked(ptr, sidecar->ctor_proto_slot);
+  *out = is_object_type(proto) ? proto : js->sym.object_proto;
+  
+  return true;
+}
+
+static inline ant_value_t sv_construct_prototype_cached(
+  ant_t *js, ant_value_t proto_source, ant_object_t *ptr, sv_func_t *func
+) {
+  ant_value_t proto;
+  if (sv_construct_prototype_data(js, ptr, func, &proto)) return proto;
+  return sv_construct_prototype_from_object(js, proto_source, ptr);
 }
 
 static inline ant_value_t sv_construct_prototype_from(
@@ -202,6 +253,11 @@ static inline ant_value_t sv_call_default_ctor(
 );
 
 static inline ant_value_t sv_call_resolve_closure(
+  sv_vm_t *vm, ant_t *js, sv_closure_t *closure,
+  ant_value_t callee_func, sv_call_ctx_t *ctx, ant_value_t *out_this
+);
+
+static inline ant_value_t sv_call_closure_after_jit(
   sv_vm_t *vm, ant_t *js, sv_closure_t *closure,
   ant_value_t callee_func, sv_call_ctx_t *ctx, ant_value_t *out_this
 );
@@ -403,6 +459,70 @@ static inline ant_value_t sv_vm_call(
   return result;
 }
 
+typedef struct {
+  ant_value_t func;
+  ant_value_t this_val;
+  ant_value_t super_val;
+  sv_closure_t *closure;
+  bool stack_overflow;
+} sv_callback_t;
+
+static constexpr uint32_t SV_CALLBACK_DIRECT_FLAGS = 
+  SV_CALL_IS_ARROW        | 
+  SV_CALL_HAS_SUPER       | 
+  SV_CALL_BORROWED_UPVALS | 
+  SV_CALL_HAS_EVAL_ENV;
+
+static inline sv_callback_t sv_callback_prepare(ant_t *js, ant_value_t func, ant_value_t this_val) {
+  sv_callback_t cb = { func, this_val, js_mkundef(), NULL, false };
+  if (vtype(func) != kTypeFunction) return cb;
+
+  sv_closure_t *closure = js_func_closure(func);
+  if (!closure->func || closure->func->is_async || closure->func->is_generator) return cb;
+  if (closure->call_flags & ~SV_CALLBACK_DIRECT_FLAGS) return cb;
+
+  cb.closure = closure;
+  cb.stack_overflow = sv_check_c_stack_overflow(js);
+  
+  if (closure->call_flags & SV_CALL_IS_ARROW) cb.this_val = closure->bound_this;
+  if (closure->call_flags & SV_CALL_HAS_SUPER) cb.super_val = closure->super_val;
+  
+  return cb;
+}
+
+static inline ant_value_t sv_callback_call(
+  sv_vm_t *vm, ant_t *js, const sv_callback_t *cb, ant_value_t *args, int argc
+) {
+  if (!cb->closure) 
+    return sv_vm_call(vm, js, cb->func, cb->this_val, args, argc, NULL, js_mkundef());
+  
+  if (cb->stack_overflow) 
+    return js_mkerr_typed(js, JS_ERR_RANGE | JS_ERR_NO_STACK, "Maximum call stack size exceeded");
+
+  sv_call_ctx_t ctx = {
+    .this_val = cb->this_val,
+    .super_val = cb->super_val,
+    .new_target = js_mkundef(),
+    .args = args,
+    .argc = argc,
+    .alloc = NULL,
+  };
+
+  sv_func_t *fn = cb->closure->func;
+  ant_value_t result;
+  
+  if (fn->jit_code) {
+    result = sv_jit_invoke(js, SV_JIT_FROM_C, fn->jit_code, vm, &ctx, cb->closure);
+    if (!sv_is_jit_bailout(result)) goto done;
+    sv_jit_on_bailout(fn);
+  }
+  result = sv_call_closure_after_jit(vm, js, cb->closure, cb->func, &ctx, NULL);
+
+done:
+  sv_vm_maybe_checkpoint_microtasks(js);
+  return result;
+}
+
 static inline ant_value_t sv_vm_call_explicit_this(
   sv_vm_t *vm, ant_t *js, ant_value_t func,
   ant_value_t this_val, ant_value_t *args, int argc
@@ -517,6 +637,14 @@ static inline ant_value_t sv_call_resolve_closure(
     sv_jit_on_bailout(fn);
   }
 
+  return sv_call_closure_after_jit(vm, js, closure, callee_func, ctx, out_this);
+}
+
+static inline ant_value_t sv_call_closure_after_jit(
+  sv_vm_t *vm, ant_t *js, sv_closure_t *closure,
+  ant_value_t callee_func, sv_call_ctx_t *ctx, ant_value_t *out_this
+) {
+  sv_func_t *fn = closure->func;
   uint32_t cc = ++fn->call_count;
   if (__builtin_expect(cc == SV_TFB_ALLOC_THRESHOLD, 0)) sv_tfb_ensure(fn);
 

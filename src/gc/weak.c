@@ -1,7 +1,6 @@
 #include "gc/weak.h"
 #include "gc/objects.h"
 
-#include "internal.h"
 #include "ptr.h"
 #include "modules/collections.h"
 
@@ -518,15 +517,14 @@ static void gc_weak_mark_all_in_list(
   ant_t *js, ant_object_t *objects, gc_weak_collection_live_fn live
 ) {
   for (ant_object_t *obj = objects; obj; obj = obj->next)
-    if (live(obj) && gc_weak_is_collection(obj))
-      gc_weak_mark_all_in_collection(js, obj);
+    if (live(js, obj) && gc_weak_is_collection(obj)) gc_weak_mark_all_in_collection(js, obj);
 }
 
 static void gc_weak_rebuild_registry_from_list(
   ant_t *js, ant_object_t *objects, gc_weak_collection_live_fn live
 ) {
   for (ant_object_t *obj = objects; obj; obj = obj->next)
-    if (live(obj) && gc_weak_is_collection(obj)) gc_weak_register(js, obj);
+    if (live(js, obj) && gc_weak_is_collection(obj)) gc_weak_register(js, obj);
 }
 
 static void gc_weak_rebuild_registry(
@@ -563,7 +561,7 @@ void gc_weak_process(
   js->weak_gc.pending_oom = false;
   for (size_t i = 0; i < js->weak_gc.collection_len; i++) {
     ant_object_t *obj = js->weak_gc.collections[i];
-    if (collection_live(obj) && obj->type_tag == kTypeWeakMap &&
+    if (collection_live(js, obj) && obj->type_tag == kTypeWeakMap &&
         (!minor || obj->flags.generation == 0))
       gc_weak_process_map(js, obj);
   }
@@ -580,7 +578,7 @@ void gc_weak_process(
     js->weak_gc.pending_active = false;
     for (size_t i = 0; i < js->weak_gc.collection_len; i++) {
       ant_object_t *obj = js->weak_gc.collections[i];
-      if (collection_live(obj)) gc_weak_mark_all_in_collection(js, obj);
+      if (collection_live(js, obj)) gc_weak_mark_all_in_collection(js, obj);
     }
     drain(js);
   } else {
@@ -588,7 +586,7 @@ void gc_weak_process(
     js->weak_gc.pending_active = false;
     for (size_t i = 0; i < js->weak_gc.collection_len; i++) {
       ant_object_t *obj = js->weak_gc.collections[i];
-      if (collection_live(obj) && (!minor || obj->flags.generation == 0))
+      if (collection_live(js, obj) && (!minor || obj->flags.generation == 0))
         gc_weak_prune_collection(js, obj);
     }
     if (minor) gc_weak_prune_minor_edges(js);
@@ -597,7 +595,7 @@ void gc_weak_process(
   size_t live = 0;
   for (size_t i = 0; i < js->weak_gc.collection_len; i++) {
     ant_object_t *obj = js->weak_gc.collections[i];
-    if (collection_live(obj)) {
+    if (collection_live(js, obj)) {
       js->weak_gc.collections[live++] = obj;
     }
   }

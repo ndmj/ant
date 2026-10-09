@@ -20,7 +20,6 @@
 #include "modules/headers.h"
 #include "modules/multipart.h"
 #include "modules/response.h"
-#include "modules/symbol.h"
 #include "modules/url.h"
 #include "modules/json.h"
 #include "streams/pipes.h"
@@ -1117,7 +1116,7 @@ RES_GETTER_END
 #undef RES_GETTER_END
 
 static ant_value_t response_inspect_finish(ant_t *js, ant_value_t this_obj, ant_value_t body_obj) {
-  ant_value_t tag_val = js_get_sym(js, this_obj, get_toStringTag_sym());
+  ant_value_t tag_val = js_get_sym(js, this_obj, js->sym.toStringTag_sym);
   const char *tag = vtype(tag_val) == kTypeString ? js_getstr(js, tag_val, NULL) : "Response";
 
   js_inspect_builder_t builder;
@@ -1222,72 +1221,6 @@ static ant_value_t js_response_clone(ant_params_t) {
   return obj;
 }
 
-ant_value_t response_create(
-  ant_t *js,
-  const char *type,
-  int status,
-  const char *status_text,
-  ant_value_t headers_obj,
-  const uint8_t *body,
-  size_t body_len,
-  const char *body_type,
-  bool immutable_headers
-) {
-  ant_value_t obj = response_new(js, immutable_headers);
-  ant_value_t headers = 0;
-  response_data_t *resp = NULL;
-
-  if (is_err(obj)) return obj;
-  resp = response_get_data(obj);
-
-  free(resp->type);
-  resp->type = strdup(type ? type : "default");
-  if (!resp->type) {
-    response_clear_and_free(obj, resp);
-    return js_mkerr(js, "out of memory");
-  }
-
-  resp->status = status;
-  free(resp->status_text);
-  resp->status_text = strdup(status_text ? status_text : "");
-  if (!resp->status_text) {
-    response_clear_and_free(obj, resp);
-    return js_mkerr(js, "out of memory");
-  }
-
-  if (body_len > 0) {
-    resp->body_data = malloc(body_len);
-    if (!resp->body_data) {
-      response_clear_and_free(obj, resp);
-      return js_mkerr(js, "out of memory");
-    }
-    memcpy(resp->body_data, body, body_len);
-  }
-
-  resp->body_size = body_len;
-  resp->body_type = body_type ? strdup(body_type) : NULL;
-  resp->body_storage = (resp->body_data || resp->body_type)
-    ? RESPONSE_BODY_STORAGE_OWNED
-    : RESPONSE_BODY_STORAGE_NONE;
-  resp->has_body = body || body_len > 0;
-  resp->body_is_stream = false;
-
-  if (is_object_type(headers_obj)) {
-    headers = headers_obj;
-    headers_set_immutable(headers, immutable_headers);
-    if (!response_apply_content_type_data(headers_get_data(headers), body_type)) {
-      response_clear_and_free(obj, resp);
-      return js_mkerr(js, "out of memory");
-    }
-    js_set_slot_wb(js, obj, SLOT_RESPONSE_HEADERS, headers);
-  } else if (!response_apply_pending_content_type(resp, body_type)) {
-    response_clear_and_free(obj, resp);
-    return js_mkerr(js, "out of memory");
-  }
-  
-  return obj;
-}
-
 ant_value_t response_create_fetched(
   ant_t *js,
   int status,
@@ -1386,8 +1319,8 @@ void init_response_module(ant_t *js) {
   GETTER("bodyUsed", body_used);
 #undef GETTER
 
-  js_set_sym(js, js->builtins.response_proto, get_inspect_sym(), js_mkfun(response_inspect));
-  js_set_sym(js, js->builtins.response_proto, get_toStringTag_sym(), js_mkstr(js, "Response", 8));
+  js_set_sym(js, js->builtins.response_proto, js->sym.inspect_sym, js_mkfun(response_inspect));
+  js_set_sym(js, js->builtins.response_proto, js->sym.toStringTag_sym, js_mkstr(js, "Response", 8));
   ctor = js_make_ctor(js, js_response_ctor, js->builtins.response_proto, "Response", 8);
   js_set(js, ctor, "error", js_mkfun(js_response_error));
   js_set(js, ctor, "redirect", js_mkfun(js_response_redirect));

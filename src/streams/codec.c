@@ -5,10 +5,8 @@
 #include "ptr.h"
 #include "errors.h"
 #include "internal.h"
-#include "silver/engine.h"
 #include "descriptors.h"
 
-#include "modules/symbol.h"
 #include "modules/buffer.h"
 #include "modules/textcodec.h"
 #include "streams/codec.h"
@@ -30,34 +28,6 @@ static ant_value_t tes_get_ts(ant_value_t obj) {
 
 static ant_value_t tds_get_ts(ant_value_t obj) {
   return js_get_slot(obj, SLOT_ENTRIES);
-}
-
-bool tes_is_stream(ant_value_t obj) {
-  return is_object_type(obj)
-    && js_check_native_tag(obj, TES_NATIVE_TAG)
-    && ts_is_stream(tes_get_ts(obj));
-}
-
-bool tds_is_stream(ant_value_t obj) {
-  return is_object_type(obj)
-    && js_check_native_tag(obj, TDS_NATIVE_TAG)
-    && ts_is_stream(tds_get_ts(obj));
-}
-
-ant_value_t tes_stream_readable(ant_value_t obj) {
-  return ts_stream_readable(tes_get_ts(obj));
-}
-
-ant_value_t tes_stream_writable(ant_value_t obj) {
-  return ts_stream_writable(tes_get_ts(obj));
-}
-
-ant_value_t tds_stream_readable(ant_value_t obj) {
-  return ts_stream_readable(tds_get_ts(obj));
-}
-
-ant_value_t tds_stream_writable(ant_value_t obj) {
-  return ts_stream_writable(tds_get_ts(obj));
 }
 
 static void tes_state_finalize(ant_t *js, ant_object_t *obj) {
@@ -409,7 +379,7 @@ void init_codec_stream_module(ant_t *js) {
   js_set_getter_desc(js, js->builtins.tes_proto, "encoding", 8, js_mkfun(js_tes_get_encoding), JS_DESC_C);
   js_set_getter_desc(js, js->builtins.tes_proto, "readable", 8, js_mkfun(js_tes_get_readable), JS_DESC_C);
   js_set_getter_desc(js, js->builtins.tes_proto, "writable", 8, js_mkfun(js_tes_get_writable), JS_DESC_C);
-  js_set_sym(js, js->builtins.tes_proto, get_toStringTag_sym(), js_mkstr(js, "TextEncoderStream", 17));
+  js_set_sym(js, js->builtins.tes_proto, js->sym.toStringTag_sym, js_mkstr(js, "TextEncoderStream", 17));
 
   ant_value_t tes_ctor = js_make_ctor(js, js_tes_ctor, js->builtins.tes_proto, "TextEncoderStream", 17);
   js_set(js, g, "TextEncoderStream", tes_ctor);
@@ -421,7 +391,7 @@ void init_codec_stream_module(ant_t *js) {
   js_set_getter_desc(js, js->builtins.tds_proto, "ignoreBOM", 9, js_mkfun(js_tds_get_ignore_bom), JS_DESC_C);
   js_set_getter_desc(js, js->builtins.tds_proto, "readable",  8, js_mkfun(js_tds_get_readable),  JS_DESC_C);
   js_set_getter_desc(js, js->builtins.tds_proto, "writable",  8, js_mkfun(js_tds_get_writable),  JS_DESC_C);
-  js_set_sym(js, js->builtins.tds_proto, get_toStringTag_sym(), js_mkstr(js, "TextDecoderStream", 17));
+  js_set_sym(js, js->builtins.tds_proto, js->sym.toStringTag_sym, js_mkstr(js, "TextDecoderStream", 17));
 
   ant_value_t tds_ctor = js_make_ctor(js, js_tds_ctor, js->builtins.tds_proto, "TextDecoderStream", 17);
   js_set(js, g, "TextDecoderStream", tds_ctor);

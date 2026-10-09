@@ -107,6 +107,20 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
                                        MIR_T_I32, "kind",
                                        MIR_T_P, "receiver_out");
 
+  c->cfunc_proto = MIR_new_proto(c->ctx, "cfunc_proto",
+                                 1, &call_ret,
+                                 4,
+                                 MIR_T_P, "js",
+                                 MIR_T_P, "args",
+                                 MIR_T_I32, "nargs",
+                                 MIR_JSVAL, "new_target");
+
+  c->native_finish_proto = MIR_new_proto(c->ctx, "native_finish_proto",
+                                         1, &call_ret,
+                                         2,
+                                         MIR_T_P, "js",
+                                         MIR_JSVAL, "result");
+
   c->stable_call_proto = MIR_new_proto(c->ctx, "stable_call_proto",
                                        1, &call_ret,
                                        7,
@@ -246,12 +260,22 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
                                    MIR_T_P, "func",
                                    MIR_T_I32, "bc_off");
 
+  MIR_type_t math_ret = MIR_T_D;
+  c->math1_proto = MIR_new_proto(c->ctx, "math1_proto", 1, &math_ret, 1, MIR_T_D, "x");
+  c->math2_proto = MIR_new_proto(c->ctx, "math2_proto", 1, &math_ret, 2, MIR_T_D, "a", MIR_T_D, "b");
+
   MIR_type_t h1_ret = MIR_JSVAL;
   c->helper1_proto = MIR_new_proto(c->ctx, "helper1_proto",
                                    1, &h1_ret, 3,
                                    MIR_T_I64, "vm",
                                    MIR_T_I64, "js",
                                    MIR_JSVAL, "v");
+
+  MIR_type_t gl_ret = MIR_JSVAL;
+  c->get_length_proto = MIR_new_proto(c->ctx, "get_length_proto",
+                                      1, &gl_ret, 2,
+                                      MIR_T_I64, "js",
+                                      MIR_JSVAL, "v");
 
   MIR_type_t ts_ret = MIR_JSVAL;
   c->to_string_proto = MIR_new_proto(c->ctx, "to_string_proto",
@@ -353,6 +377,14 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
                                          MIR_T_I64, "js",
                                          MIR_T_P, "uv",
                                          MIR_T_I64, "val");
+  c->elem_barrier_proto = MIR_new_proto(c->ctx, "elem_barrier_proto",
+                                        0, NULL, 4,
+                                        MIR_T_I64, "js",
+                                        MIR_T_I64, "arr",
+                                        MIR_T_I64, "idx",
+                                        MIR_T_I64, "val");
+  c->param_counters_off_proto = MIR_new_proto(c->ctx, "param_counters_off_proto",
+                                              0, NULL, 2, MIR_T_P, "func", MIR_T_I64, "params");
 
   c->adopt_open_upvalues_proto = MIR_new_proto(c->ctx, "adopt_open_upvalues_proto",
                                                0, NULL, 2,
@@ -432,13 +464,14 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
 
   MIR_type_t pf_ret = MIR_JSVAL;
   c->put_field_proto = MIR_new_proto(c->ctx, "pf_proto",
-                                     1, &pf_ret, 6,
+                                     1, &pf_ret, 7,
                                      MIR_T_I64, "vm",
                                      MIR_T_I64, "js",
                                      MIR_JSVAL, "obj",
                                      MIR_JSVAL, "val",
                                      MIR_T_P, "atom",
-                                     MIR_T_P, "ic");
+                                     MIR_T_P, "ic",
+                                     MIR_T_I32, "strict");
 
   c->remember_obj_proto = MIR_new_proto(c->ctx, "remember_obj_proto",
                                         0, NULL, 2,
@@ -446,7 +479,8 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
                                         MIR_T_P, "obj");
 
   c->shape_transition_proto = MIR_new_proto(c->ctx, "shape_transition_proto",
-                                            0, NULL, 2,
+                                            0, NULL, 3,
+                                            MIR_T_P, "js",
                                             MIR_T_P, "obj",
                                             MIR_T_P, "to_shape");
 
@@ -528,6 +562,17 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
                                MIR_JSVAL, "new_target",
                                MIR_T_P, "args",
                                MIR_T_I32, "argc");
+  c->new_this_proto = MIR_new_proto(c->ctx, "new_this_proto",
+                                    1, &nw_ret, 4,
+                                    MIR_T_I64, "js",
+                                    MIR_JSVAL, "func",
+                                    MIR_JSVAL, "new_target",
+                                    MIR_T_I32, "checked");
+  c->new_result_proto = MIR_new_proto(c->ctx, "new_result_proto",
+                                      1, &nw_ret, 3,
+                                      MIR_JSVAL, "func",
+                                      MIR_JSVAL, "obj",
+                                      MIR_JSVAL, "result");
 
   MIR_type_t special_obj_ret = MIR_JSVAL;
   c->special_obj_proto = MIR_new_proto(c->ctx, "soj_proto",
@@ -599,6 +644,7 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
   c->imp_gt = MIR_new_import(c->ctx, "jit_helper_gt");
   c->imp_ge = MIR_new_import(c->ctx, "jit_helper_ge");
   c->imp_call = MIR_new_import(c->ctx, "jit_helper_call");
+  c->imp_native_finish = MIR_new_import(c->ctx, "jit_helper_native_finish");
   c->imp_call_method = MIR_new_import(c->ctx, "jit_helper_call_method");
   c->imp_call_array_includes = MIR_new_import(c->ctx, "jit_helper_call_array_includes");
   c->imp_call_char_code_at = MIR_new_import(c->ctx, "jit_helper_call_char_code_at");
@@ -646,6 +692,15 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
   c->imp_promote_due = MIR_new_import(c->ctx, "jit_helper_promote_due");
   c->imp_close_upval = MIR_new_import(c->ctx, "jit_helper_close_upval");
   c->imp_upval_barrier = MIR_new_import(c->ctx, "jit_helper_upval_barrier");
+  c->imp_upval_flagged = MIR_new_import(c->ctx, "jit_helper_upval_flagged");
+  c->imp_elem_barrier = MIR_new_import(c->ctx, "jit_helper_elem_barrier");
+  c->imp_param_counters_off = MIR_new_import(c->ctx, "jit_helper_disable_param_counters");
+  c->imp_number_to_string = MIR_new_import(c->ctx, "jit_helper_number_to_string");
+  for (int i = 0; i < ANT_MATH_INTRINSIC_COUNT; i++) {
+    char name[32];
+    snprintf(name, sizeof(name), "ant_math_%s", ant_math_intrinsic_names[i]);
+    c->imp_math[i] = i == ANT_MATH_ABS ? NULL : MIR_new_import(c->ctx, name);
+  }
   c->imp_adopt_open_upvalues = MIR_new_import(c->ctx, "jit_helper_adopt_open_upvalues");
   c->imp_take_open_upvalues = MIR_new_import(c->ctx, "jit_helper_take_open_upvalues");
   c->imp_take_open_upvalues_rebase = MIR_new_import(c->ctx, "jit_helper_take_open_upvalues_rebase");
@@ -661,9 +716,9 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
   c->imp_sne = MIR_new_import(c->ctx, "jit_helper_sne");
   c->imp_put_field = MIR_new_import(c->ctx, "jit_helper_put_field_ic");
   c->imp_shape_transition = MIR_new_import(c->ctx, "jit_helper_shape_transition");
-  c->imp_remember_obj = MIR_new_import(c->ctx, "gc_remember_add");
+  c->imp_remember_obj = MIR_new_import(c->ctx, "gc_remember_props");
   c->imp_get_elem = MIR_new_import(c->ctx, "jit_helper_get_elem");
-  c->imp_put_elem = MIR_new_import(c->ctx, "jit_helper_put_elem");
+  c->imp_put_elem = MIR_new_import(c->ctx, c->func->is_strict ? "jit_helper_put_elem_strict" : "jit_helper_put_elem");
   c->imp_get_private = MIR_new_import(c->ctx, "jit_helper_get_private");
   c->imp_put_private = MIR_new_import(c->ctx, "jit_helper_put_private");
   c->imp_put_global = MIR_new_import(c->ctx, "jit_helper_put_global");
@@ -689,9 +744,11 @@ void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type) {
   c->imp_is_truthy = MIR_new_import(c->ctx, "jit_helper_is_truthy");
   c->imp_typeof = MIR_new_import(c->ctx, "jit_helper_typeof");
   c->imp_new = MIR_new_import(c->ctx, "jit_helper_new");
+  c->imp_new_this = MIR_new_import(c->ctx, "jit_helper_new_this");
+  c->imp_new_result = MIR_new_import(c->ctx, "jit_helper_new_result");
   c->imp_instanceof = MIR_new_import(c->ctx, "jit_helper_instanceof");
   c->imp_call_is_proto = MIR_new_import(c->ctx, "jit_helper_call_is_proto");
-  c->imp_delete = MIR_new_import(c->ctx, "jit_helper_delete");
+  c->imp_delete = MIR_new_import(c->ctx, c->func->is_strict ? "jit_helper_delete_strict" : "jit_helper_delete");
   c->imp_set_name = MIR_new_import(c->ctx, "jit_helper_set_name");
   c->imp_stack_ovf_err = MIR_new_import(c->ctx, "jit_helper_stack_overflow_error");
   c->imp_tier_up = MIR_new_import(c->ctx, "jit_helper_tier_up");

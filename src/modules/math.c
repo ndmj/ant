@@ -4,8 +4,8 @@
 #include "errors.h"
 #include "internal.h"
 
-#include "modules/symbol.h"
 #include "modules/crypto.h"
+#include "modules/math.h"
 
 #if DBL_MANT_DIG >= 64
 #error "Unsupported double mantissa width for Math.random"
@@ -18,6 +18,55 @@ enum {
 
 static const double math_random_scale =
   1.0 / (double)(UINT64_C(1) << MATH_RANDOM_MANTISSA_BITS);
+
+const char *const ant_math_intrinsic_names[ANT_MATH_INTRINSIC_COUNT] = {
+  [ANT_MATH_ABS] = "abs",
+  [ANT_MATH_CEIL] = "ceil",
+  [ANT_MATH_FLOOR] = "floor",
+  [ANT_MATH_ROUND] = "round",
+  [ANT_MATH_SIGN] = "sign",
+  [ANT_MATH_SQRT] = "sqrt",
+  [ANT_MATH_TRUNC] = "trunc",
+  [ANT_MATH_IMUL] = "imul",
+  [ANT_MATH_MAX] = "max",
+  [ANT_MATH_MIN] = "min",
+};
+
+double ant_math_ceil(double x) { return ceil(x); }
+double ant_math_floor(double x) { return floor(x); }
+double ant_math_sqrt(double x) { return sqrt(x); }
+double ant_math_trunc(double x) { return trunc(x); }
+
+double ant_math_round(double x) {
+  if (isnan(x) || isinf(x) || x == 0.0) return x;
+  if (x < 0.0 && x >= -0.5) return -0.0;
+  double r = floor(x);
+  return x - r >= 0.5 ? r + 1.0 : r;
+}
+
+double ant_math_sign(double x) {
+  if (x > 0) return 1.0;
+  if (x < 0) return -1.0;
+  return x;
+}
+
+double ant_math_imul(double a, double b) {
+  return (double)(int32_t)((uint32_t)js_to_int32(a) * (uint32_t)js_to_int32(b));
+}
+
+double ant_math_max(double a, double b) {
+  if (isnan(a) || isnan(b)) return JS_NAN;
+  if (b > a) return b;
+  if (b == 0.0 && a == 0.0 && !signbit(b) && signbit(a)) return b;
+  return a;
+}
+
+double ant_math_min(double a, double b) {
+  if (isnan(a) || isnan(b)) return JS_NAN;
+  if (b < a) return b;
+  if (b == 0.0 && a == 0.0 && signbit(b) && !signbit(a)) return b;
+  return a;
+}
 
 static ant_value_t builtin_Math_abs(ant_params_t) {
   double x = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
@@ -77,7 +126,7 @@ static ant_value_t builtin_Math_cbrt(ant_params_t) {
 static ant_value_t builtin_Math_ceil(ant_params_t) {
   double x = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
   if (isnan(x)) return tov(JS_NAN);
-  return tov(ceil(x));
+  return tov(ant_math_ceil(x));
 }
 
 static ant_value_t builtin_Math_clz32(ant_params_t) {
@@ -118,7 +167,7 @@ static ant_value_t builtin_Math_expm1(ant_params_t) {
 static ant_value_t builtin_Math_floor(ant_params_t) {
   double x = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
   if (isnan(x)) return tov(JS_NAN);
-  return tov(floor(x));
+  return tov(ant_math_floor(x));
 }
 
 static ant_value_t builtin_Math_fround(ant_params_t) {
@@ -143,9 +192,7 @@ static ant_value_t builtin_Math_hypot(ant_params_t) {
 
 static ant_value_t builtin_Math_imul(ant_params_t) {
   if (nargs < 2) return tov(0);
-  int32_t a = js_to_int32(js_to_number(js, args[0]));
-  int32_t b = js_to_int32(js_to_number(js, args[1]));
-  return tov((double)((int32_t)((uint32_t)a * (uint32_t)b)));
+  return tov(ant_math_imul(js_to_number(js, args[0]), js_to_number(js, args[1])));
 }
 
 static ant_value_t builtin_Math_log(ant_params_t) {
@@ -179,8 +226,7 @@ static ant_value_t builtin_Math_max(ant_params_t) {
   for (int i = 1; i < nargs; i++) {
     double v = js_to_number(js, args[i]);
     if (isnan(v)) return tov(JS_NAN);
-    if (v > max_val) { max_val = v; continue; }
-    if (v == 0.0 && max_val == 0.0 && !signbit(v) && signbit(max_val)) max_val = v;
+    max_val = ant_math_max(max_val, v);
   }
   return tov(max_val);
 }
@@ -194,17 +240,7 @@ static ant_value_t builtin_Math_min(ant_params_t) {
   for (int i = 1; i < nargs; i++) {
     double v = vtype(args[i]) == kTypeNumber ? tod(args[i]) : js_to_number(js, args[i]);
     if (isnan(v)) return tov(JS_NAN);
-    
-    if (v < min_val) {
-      min_val = v;
-      continue;
-    }
-    
-    if (v == 0.0 
-      && min_val == 0.0 
-      && signbit(v) 
-      && !signbit(min_val)
-    ) min_val = v;
+    min_val = ant_math_min(min_val, v);
   }
   
   return tov(min_val);
@@ -229,17 +265,14 @@ static ant_value_t builtin_Math_random(ant_params_t) {
 
 static ant_value_t builtin_Math_round(ant_params_t) {
   double x = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
-  if (isnan(x) || isinf(x) || x == 0.0) return tov(x);
-  if (x < 0.0 && x >= -0.5) return tov(-0.0);
-  return tov(floor(x + 0.5));
+  if (isnan(x)) return tov(JS_NAN);
+  return tov(ant_math_round(x));
 }
 
 static ant_value_t builtin_Math_sign(ant_params_t) {
   double v = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
   if (isnan(v)) return tov(JS_NAN);
-  if (v > 0) return tov(1.0);
-  if (v < 0) return tov(-1.0);
-  return tov(v);
+  return tov(ant_math_sign(v));
 }
 
 static ant_value_t builtin_Math_sin(ant_params_t) {
@@ -257,7 +290,7 @@ static ant_value_t builtin_Math_sinh(ant_params_t) {
 static ant_value_t builtin_Math_sqrt(ant_params_t) {
   double x = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
   if (isnan(x)) return tov(JS_NAN);
-  return tov(sqrt(x));
+  return tov(ant_math_sqrt(x));
 }
 
 static ant_value_t builtin_Math_tan(ant_params_t) {
@@ -275,7 +308,7 @@ static ant_value_t builtin_Math_tanh(ant_params_t) {
 static ant_value_t builtin_Math_trunc(ant_params_t) {
   double x = (nargs < 1) ? JS_NAN : js_to_number(js, args[0]);
   if (isnan(x)) return tov(JS_NAN);
-  return tov(trunc(x));
+  return tov(ant_math_trunc(x));
 }
 
 void init_math_module(ant_t *js) {
@@ -283,50 +316,54 @@ void init_math_module(ant_t *js) {
   ant_value_t object_proto = js->sym.object_proto;
 
   js_set_proto_init(math_obj, object_proto);
-  js_setprop(js, math_obj, js_mkstr(js, "E", 1), tov(M_E));
-  js_setprop(js, math_obj, js_mkstr(js, "LN10", 4), tov(M_LN10));
-  js_setprop(js, math_obj, js_mkstr(js, "LN2", 3), tov(M_LN2));
-  js_setprop(js, math_obj, js_mkstr(js, "LOG10E", 6), tov(M_LOG10E));
-  js_setprop(js, math_obj, js_mkstr(js, "LOG2E", 5), tov(M_LOG2E));
-  js_setprop(js, math_obj, js_mkstr(js, "PI", 2), tov(M_PI));
-  js_setprop(js, math_obj, js_mkstr(js, "SQRT1_2", 7), tov(M_SQRT1_2));
-  js_setprop(js, math_obj, js_mkstr(js, "SQRT2", 5), tov(M_SQRT2));
-  js_setprop(js, math_obj, js_mkstr(js, "abs", 3), js_mkfun(builtin_Math_abs));
-  js_setprop(js, math_obj, js_mkstr(js, "acos", 4), js_mkfun(builtin_Math_acos));
-  js_setprop(js, math_obj, js_mkstr(js, "acosh", 5), js_mkfun(builtin_Math_acosh));
-  js_setprop(js, math_obj, js_mkstr(js, "asin", 4), js_mkfun(builtin_Math_asin));
-  js_setprop(js, math_obj, js_mkstr(js, "asinh", 5), js_mkfun(builtin_Math_asinh));
-  js_setprop(js, math_obj, js_mkstr(js, "atan", 4), js_mkfun(builtin_Math_atan));
-  js_setprop(js, math_obj, js_mkstr(js, "atanh", 5), js_mkfun(builtin_Math_atanh));
-  js_setprop(js, math_obj, js_mkstr(js, "atan2", 5), js_mkfun(builtin_Math_atan2));
-  js_setprop(js, math_obj, js_mkstr(js, "cbrt", 4), js_mkfun(builtin_Math_cbrt));
-  js_setprop(js, math_obj, js_mkstr(js, "ceil", 4), js_mkfun(builtin_Math_ceil));
-  js_setprop(js, math_obj, js_mkstr(js, "clz32", 5), js_mkfun(builtin_Math_clz32));
-  js_setprop(js, math_obj, js_mkstr(js, "cos", 3), js_mkfun(builtin_Math_cos));
-  js_setprop(js, math_obj, js_mkstr(js, "cosh", 4), js_mkfun(builtin_Math_cosh));
-  js_setprop(js, math_obj, js_mkstr(js, "exp", 3), js_mkfun(builtin_Math_exp));
-  js_setprop(js, math_obj, js_mkstr(js, "expm1", 5), js_mkfun(builtin_Math_expm1));
-  js_setprop(js, math_obj, js_mkstr(js, "floor", 5), js_mkfun(builtin_Math_floor));
-  js_setprop(js, math_obj, js_mkstr(js, "fround", 6), js_mkfun(builtin_Math_fround));
-  js_setprop(js, math_obj, js_mkstr(js, "hypot", 5), js_mkfun(builtin_Math_hypot));
-  js_setprop(js, math_obj, js_mkstr(js, "imul", 4), js_mkfun(builtin_Math_imul));
-  js_setprop(js, math_obj, js_mkstr(js, "log", 3), js_mkfun(builtin_Math_log));
-  js_setprop(js, math_obj, js_mkstr(js, "log1p", 5), js_mkfun(builtin_Math_log1p));
-  js_setprop(js, math_obj, js_mkstr(js, "log10", 5), js_mkfun(builtin_Math_log10));
-  js_setprop(js, math_obj, js_mkstr(js, "log2", 4), js_mkfun(builtin_Math_log2));
-  js_setprop(js, math_obj, js_mkstr(js, "max", 3), js_mkfun(builtin_Math_max));
-  js_setprop(js, math_obj, js_mkstr(js, "min", 3), js_mkfun(builtin_Math_min));
-  js_setprop(js, math_obj, js_mkstr(js, "pow", 3), js_mkfun(builtin_Math_pow));
-  js_setprop(js, math_obj, js_mkstr(js, "random", 6), js_mkfun(builtin_Math_random));
-  js_setprop(js, math_obj, js_mkstr(js, "round", 5), js_mkfun(builtin_Math_round));
-  js_setprop(js, math_obj, js_mkstr(js, "sign", 4), js_mkfun(builtin_Math_sign));
-  js_setprop(js, math_obj, js_mkstr(js, "sin", 3), js_mkfun(builtin_Math_sin));
-  js_setprop(js, math_obj, js_mkstr(js, "sinh", 4), js_mkfun(builtin_Math_sinh));
-  js_setprop(js, math_obj, js_mkstr(js, "sqrt", 4), js_mkfun(builtin_Math_sqrt));
-  js_setprop(js, math_obj, js_mkstr(js, "tan", 3), js_mkfun(builtin_Math_tan));
-  js_setprop(js, math_obj, js_mkstr(js, "tanh", 4), js_mkfun(builtin_Math_tanh));
-  js_setprop(js, math_obj, js_mkstr(js, "trunc", 5), js_mkfun(builtin_Math_trunc));
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "E", 1), tov(M_E), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "LN10", 4), tov(M_LN10), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "LN2", 3), tov(M_LN2), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "LOG10E", 6), tov(M_LOG10E), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "LOG2E", 5), tov(M_LOG2E), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "PI", 2), tov(M_PI), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "SQRT1_2", 7), tov(M_SQRT1_2), 0);
+  mkprop_exact_attrs(js, math_obj, js_mkstr(js, "SQRT2", 5), tov(M_SQRT2), 0);
   
-  js_set_sym(js, math_obj, get_toStringTag_sym(), js_mkstr(js, "Math", 4));
+  defmethod(js, math_obj, "abs", 3, js_mkfun_arity(builtin_Math_abs, 1));
+  defmethod(js, math_obj, "acos", 4, js_mkfun_arity(builtin_Math_acos, 1));
+  defmethod(js, math_obj, "acosh", 5, js_mkfun_arity(builtin_Math_acosh, 1));
+  defmethod(js, math_obj, "asin", 4, js_mkfun_arity(builtin_Math_asin, 1));
+  defmethod(js, math_obj, "asinh", 5, js_mkfun_arity(builtin_Math_asinh, 1));
+  defmethod(js, math_obj, "atan", 4, js_mkfun_arity(builtin_Math_atan, 1));
+  defmethod(js, math_obj, "atanh", 5, js_mkfun_arity(builtin_Math_atanh, 1));
+  defmethod(js, math_obj, "atan2", 5, js_mkfun_arity(builtin_Math_atan2, 2));
+  defmethod(js, math_obj, "cbrt", 4, js_mkfun_arity(builtin_Math_cbrt, 1));
+  defmethod(js, math_obj, "ceil", 4, js_mkfun_arity(builtin_Math_ceil, 1));
+  defmethod(js, math_obj, "clz32", 5, js_mkfun_arity(builtin_Math_clz32, 1));
+  defmethod(js, math_obj, "cos", 3, js_mkfun_arity(builtin_Math_cos, 1));
+  defmethod(js, math_obj, "cosh", 4, js_mkfun_arity(builtin_Math_cosh, 1));
+  defmethod(js, math_obj, "exp", 3, js_mkfun_arity(builtin_Math_exp, 1));
+  defmethod(js, math_obj, "expm1", 5, js_mkfun_arity(builtin_Math_expm1, 1));
+  defmethod(js, math_obj, "floor", 5, js_mkfun_arity(builtin_Math_floor, 1));
+  defmethod(js, math_obj, "fround", 6, js_mkfun_arity(builtin_Math_fround, 1));
+  defmethod(js, math_obj, "hypot", 5, js_mkfun_arity(builtin_Math_hypot, 2));
+  defmethod(js, math_obj, "imul", 4, js_mkfun_arity(builtin_Math_imul, 2));
+  defmethod(js, math_obj, "log", 3, js_mkfun_arity(builtin_Math_log, 1));
+  defmethod(js, math_obj, "log1p", 5, js_mkfun_arity(builtin_Math_log1p, 1));
+  defmethod(js, math_obj, "log10", 5, js_mkfun_arity(builtin_Math_log10, 1));
+  defmethod(js, math_obj, "log2", 4, js_mkfun_arity(builtin_Math_log2, 1));
+  defmethod(js, math_obj, "max", 3, js_mkfun_arity(builtin_Math_max, 2));
+  defmethod(js, math_obj, "min", 3, js_mkfun_arity(builtin_Math_min, 2));
+  defmethod(js, math_obj, "pow", 3, js_mkfun_arity(builtin_Math_pow, 2));
+  defmethod(js, math_obj, "random", 6, js_mkfun_arity(builtin_Math_random, 0));
+  defmethod(js, math_obj, "round", 5, js_mkfun_arity(builtin_Math_round, 1));
+  defmethod(js, math_obj, "sign", 4, js_mkfun_arity(builtin_Math_sign, 1));
+  defmethod(js, math_obj, "sin", 3, js_mkfun_arity(builtin_Math_sin, 1));
+  defmethod(js, math_obj, "sinh", 4, js_mkfun_arity(builtin_Math_sinh, 1));
+  defmethod(js, math_obj, "sqrt", 4, js_mkfun_arity(builtin_Math_sqrt, 1));
+  defmethod(js, math_obj, "tan", 3, js_mkfun_arity(builtin_Math_tan, 1));
+  defmethod(js, math_obj, "tanh", 4, js_mkfun_arity(builtin_Math_tanh, 1));
+  defmethod(js, math_obj, "trunc", 5, js_mkfun_arity(builtin_Math_trunc, 1));
+  
+  for (int i = 0; i < ANT_MATH_INTRINSIC_COUNT; i++)
+    js->sym.math_fns[i] = js_get(js, math_obj, ant_math_intrinsic_names[i]);
+
+  js_set_sym(js, math_obj, js->sym.toStringTag_sym, js_mkstr(js, "Math", 4));
   js_set_global_builtin(js, "Math", math_obj);
 }

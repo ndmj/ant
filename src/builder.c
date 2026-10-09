@@ -1,7 +1,6 @@
 #include "builder.h"
 
 #include "internal.h"
-#include "modules/symbol.h"
 #include "silver/engine.h"
 
 #include <math.h>
@@ -376,18 +375,33 @@ static bool js_inspect_property_prefix(js_inspect_builder_t *builder) {
   return builder->inline_mode || js_inspect_append_indent(builder, builder->js->stringify.indent);
 }
 
-bool js_inspect_object_body(js_inspect_builder_t *builder, ant_value_t obj) {
-  if (builder->closed) return true;
-
+static void js_inspect_begin_body(js_inspect_builder_t *builder) {
   if (!builder->bare_mode && !builder->inline_mode && !builder->did_indent) {
     builder->js->stringify.indent++;
     builder->did_indent = true;
   }
+}
+
+bool js_inspect_field(js_inspect_builder_t *builder, const char *key, ant_value_t value) {
+  if (builder->closed) return true;
+  js_inspect_begin_body(builder);
+  
+  if (!js_inspect_property_prefix(builder)) return false;
+  if (!js_inspect_append(builder, key, strlen(key))) return false;
+  if (!js_inspect_append(builder, ": ", 2)) return false;
+  
+  return js_inspect_append_tostr(builder, value);
+}
+
+bool js_inspect_object_body(js_inspect_builder_t *builder, ant_value_t obj) {
+  if (builder->closed) return true;
+  js_inspect_begin_body(builder);
 
   ant_t *js = builder->js;
-  ant_value_t tag_sym = get_toStringTag_sym();
+  ant_value_t tag_sym = js->sym.toStringTag_sym;
   ant_value_t as_obj = js_as_obj(obj);
   ant_object_t *ptr = js_obj_ptr(as_obj);
+  
   uintptr_t obj_off = (uintptr_t)vdata(as_obj);
   uint32_t shape_count = (ptr && ptr->shape) ? ant_shape_count(ptr->shape) : 0;
 

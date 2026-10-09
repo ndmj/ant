@@ -38,6 +38,13 @@ typedef struct {
   ant_value_t setter;
 } ant_shape_prop_t;
 
+static constexpr size_t ANT_SHAPE_REF_COUNT_OFFSET = 0;
+static constexpr size_t ANT_SHAPE_INDEX_KEYS_OFFSET = 45;
+
+static inline bool ant_shape_may_have_index_keys(const ant_shape_t *shape) {
+  return shape && *(const bool *)((const char *)shape + ANT_SHAPE_INDEX_KEYS_OFFSET);
+}
+
 ant_shape_t *ant_shape_new(void);
 ant_shape_t *ant_shape_new_with_inobj_limit(uint8_t inobj_limit);
 ant_shape_t *ant_shape_clone(const ant_shape_t *shape);
@@ -46,19 +53,18 @@ ant_shape_t *ant_shape_clone_bulk(const ant_shape_t *shape, uint32_t extra);
 
 void ant_shape_retain(ant_shape_t *shape);
 void ant_shape_release(ant_shape_t *shape);
+void ant_shape_mark_jit_snapshot(ant_shape_t *shape);
 void ant_shape_transition_existing(ant_shape_t **shape_pp, ant_shape_t *to_shape);
 
 uint8_t ant_shape_get_inobj_limit(const ant_shape_t *shape);
 int32_t ant_shape_lookup_interned(const ant_shape_t *shape, const char *interned);
 int32_t ant_shape_lookup_symbol(const ant_shape_t *shape, ant_offset_t sym_off);
 
-bool ant_shape_add_interned(ant_shape_t *shape, const char *interned, uint8_t attrs, uint32_t *out_slot);
-bool ant_shape_add_symbol(ant_shape_t *shape, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot);
-
-bool ant_shape_add_interned_tr(ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot);
-bool ant_shape_add_symbol_tr(ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot);
-bool ant_shape_add_interned_keyed_tr(ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot);
-bool ant_shape_add_symbol_keyed_tr(ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot);
+bool ant_shape_add_interned(ant_t *js, ant_shape_t *shape, const char *interned, uint8_t attrs, uint32_t *out_slot);
+bool ant_shape_add_interned_tr(ant_t *js, ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot);
+bool ant_shape_add_symbol_tr(ant_t *js, ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot);
+bool ant_shape_add_interned_keyed_tr(ant_t *js, ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot);
+bool ant_shape_add_symbol_keyed_tr(ant_t *js, ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot);
 
 // Marks a slot deleted without moving later properties. Slot order is property order,
 // and the spec requires string keys in insertion order. Reusing or swapping the hole
@@ -69,7 +75,7 @@ bool ant_shape_add_symbol_keyed_tr(ant_shape_t **shape_pp, ant_offset_t sym_off,
 // invalidates locations for moved properties. Never hold a location across a setter,
 // proxy trap, finalizer or other user callable; resolve it again afterwards. Every
 // caller here does.
-bool ant_shape_remove_slot(ant_shape_t *shape, uint32_t slot);
+bool ant_shape_remove_slot(ant_t *js, ant_shape_t *shape, uint32_t slot);
 bool ant_shape_should_compact(const ant_shape_t *shape);
 bool ant_shape_is_shared(const ant_shape_t *shape);
 
@@ -78,13 +84,12 @@ bool ant_shape_may_have_gc_refs(const ant_shape_t *shape);
 uint32_t ant_shape_compact(ant_shape_t *shape);
 uint8_t ant_shape_get_attrs(const ant_shape_t *shape, uint32_t slot);
 
-const uint32_t *ant_shape_jit_guard(const ant_shape_t *shape);
 const ant_shape_prop_t *ant_shape_prop_at(const ant_shape_t *shape, uint32_t slot);
 ant_shape_prop_t *ant_shape_prop_mut_at(ant_shape_t *shape, uint32_t slot);
 
-bool ant_shape_set_attrs_interned(ant_shape_t *shape, const char *interned, uint8_t attrs);
-bool ant_shape_set_attrs_symbol(ant_shape_t *shape, ant_offset_t sym_off, uint8_t attrs);
-bool ant_shape_clear_accessor_slot(ant_shape_t *shape, uint32_t slot);
+bool ant_shape_set_attrs_interned(ant_t *js, ant_shape_t *shape, const char *interned, uint8_t attrs);
+bool ant_shape_set_attrs_symbol(ant_t *js, ant_shape_t *shape, ant_offset_t sym_off, uint8_t attrs);
+bool ant_shape_clear_accessor_slot(ant_t *js, ant_shape_t *shape, uint32_t slot);
 
 void ant_gc_shapes_begin(void);
 void ant_gc_shapes_mark(ant_shape_t *shape);
@@ -93,17 +98,7 @@ bool ant_gc_shapes_sweep(void);
 size_t ant_shape_total_bytes(void);
 size_t ant_shape_storage_bytes(const ant_shape_t *shape);
 
-extern uint32_t ant_ic_epoch_counter;
-extern uint32_t ant_ic_obj_epoch_counter;
-
-static inline void ant_ic_epoch_bump(void) {
-  ant_ic_epoch_counter++;
-  if (ant_ic_epoch_counter == 0) ant_ic_epoch_counter = 1;
-}
-
-static inline void ant_ic_obj_epoch_bump(void) {
-  ant_ic_obj_epoch_counter++;
-  if (ant_ic_obj_epoch_counter == 0) ant_ic_obj_epoch_counter = 1;
-}
+void ant_ic_epoch_bump(ant_t *js);
+void ant_ic_obj_epoch_bump(ant_t *js);
 
 #endif

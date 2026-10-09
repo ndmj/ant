@@ -20,6 +20,8 @@ typedef struct jit_compile {
   MIR_item_t helper2_proto;
   MIR_item_t private_put_proto;
   MIR_item_t call_proto;
+  MIR_item_t cfunc_proto;
+  MIR_item_t native_finish_proto;
   MIR_item_t call_string_intrinsic_proto;
   MIR_item_t call_map_template_proto;
   MIR_item_t map_template_fast_proto;
@@ -42,6 +44,7 @@ typedef struct jit_compile {
   MIR_item_t call_is_proto;
   MIR_item_t helper1_proto;
   MIR_item_t to_string_proto;
+  MIR_item_t get_length_proto;
   MIR_item_t normalize_this_proto;
   MIR_item_t str_append_local_proto;
   MIR_item_t str_append_local_snapshot_proto;
@@ -54,6 +57,8 @@ typedef struct jit_compile {
   MIR_item_t closure_proto;
   MIR_item_t close_upval_proto;
   MIR_item_t upval_barrier_proto;
+  MIR_item_t elem_barrier_proto;
+  MIR_item_t param_counters_off_proto;
   MIR_item_t adopt_open_upvalues_proto;
   MIR_item_t take_open_upvalues_proto;
   MIR_item_t take_open_upvalues_rebase_proto;
@@ -74,6 +79,8 @@ typedef struct jit_compile {
   MIR_item_t regexp_proto;
   MIR_item_t throw_error_proto;
   MIR_item_t new_proto;
+  MIR_item_t new_this_proto;
+  MIR_item_t new_result_proto;
   MIR_item_t special_obj_proto;
   MIR_item_t strict_arguments_proto;
   MIR_item_t forward_arguments_proto;
@@ -96,6 +103,7 @@ typedef struct jit_compile {
   MIR_item_t imp_gt;
   MIR_item_t imp_ge;
   MIR_item_t imp_call;
+  MIR_item_t imp_native_finish;
   MIR_item_t imp_call_method;
   MIR_item_t imp_call_array_includes;
   MIR_item_t imp_call_char_code_at;
@@ -133,6 +141,13 @@ typedef struct jit_compile {
   MIR_item_t imp_promote_due;
   MIR_item_t imp_close_upval;
   MIR_item_t imp_upval_barrier;
+  MIR_item_t imp_upval_flagged;
+  MIR_item_t imp_elem_barrier;
+  MIR_item_t imp_param_counters_off;
+  MIR_item_t imp_number_to_string;
+  MIR_item_t math1_proto;
+  MIR_item_t math2_proto;
+  MIR_item_t imp_math[ANT_MATH_INTRINSIC_COUNT];
   MIR_item_t imp_adopt_open_upvalues;
   MIR_item_t imp_take_open_upvalues;
   MIR_item_t imp_take_open_upvalues_rebase;
@@ -176,6 +191,8 @@ typedef struct jit_compile {
   MIR_item_t imp_is_truthy;
   MIR_item_t imp_typeof;
   MIR_item_t imp_new;
+  MIR_item_t imp_new_this;
+  MIR_item_t imp_new_result;
   MIR_item_t imp_instanceof;
   MIR_item_t imp_call_is_proto;
   MIR_item_t imp_delete;
@@ -200,6 +217,9 @@ typedef struct jit_compile {
   MIR_reg_t r_tmp;
   MIR_reg_t r_tmp2;
   MIR_reg_t r_bool;
+  bool gfp_regs;
+  MIR_reg_t r_gfp_ptr, r_gfp_tag, r_gfp_shape;
+  MIR_reg_t r_gfp_epoch, r_gfp_e, r_gfp_end, r_gfp_t, r_gfp_t2, r_gfp_src, r_gfp_idx, r_gfp_lim;
   MIR_reg_t r_err_tmp;
   MIR_reg_t r_d_slot;
   MIR_reg_t r_d_one;
@@ -235,6 +255,10 @@ typedef struct jit_compile {
   MIR_reg_t local_reg_limit;
   MIR_reg_t param_cache[JIT_PARAM_HOIST_CAP];
   MIR_reg_t param_d_cache[JIT_PARAM_HOIST_CAP];
+  MIR_reg_t param_num[JIT_PARAM_HOIST_CAP];
+  MIR_reg_t param_num_ok[JIT_PARAM_HOIST_CAP];
+  uint8_t induction_params;
+  MIR_reg_t param_shadow[JIT_PARAM_HOIST_CAP];
   MIR_reg_t hoisted_upvalue_cell;
   int hoisted_upvalue;
   ant_t *js;
@@ -261,6 +285,7 @@ typedef struct jit_compile {
   bool has_captured_params;
   bool has_captures;
   uint8_t *dnum_locals;
+  uint8_t *induction_locals;
   jit_integer_range_t *entry_integer_ranges;
   bool params_in_slotbuf;
   bool has_captured_slots;
@@ -294,6 +319,9 @@ typedef struct jit_compile {
   int sz;
   MIR_insn_t previous_insn;
   int integer_store;
+  MIR_reg_t cmp_bit;
+  MIR_reg_t cmp_value;
+  int cmp_end;
   MIR_reg_t integer_value;
   jit_integer_range_t integer_range;
 } jit_compile_t;
@@ -304,6 +332,14 @@ static inline bool jit_speculate_unseen_numeric(const jit_compile_t *c, uint8_t 
 
 void jit_emit_exit_ret(jit_compile_t *c, MIR_op_t ret_op);
 void jit_emit_throw_if_error(jit_compile_t *c, MIR_reg_t value_reg);
+void jit_emit_element_barrier(
+    jit_compile_t *c, MIR_reg_t obj, MIR_reg_t index,
+    MIR_reg_t val, MIR_reg_t flags, MIR_label_t skip);
+void jit_emit_builtin_call_fast(
+  jit_compile_t *c, MIR_reg_t func, MIR_reg_t this_val,
+  MIR_reg_t args, uint16_t argc, MIR_reg_t result,
+  MIR_label_t generic, MIR_label_t done
+);
 void jit_setup_prototypes(jit_compile_t *c, MIR_type_t ret_type);
 bool jit_setup_frame(jit_compile_t *c);
 

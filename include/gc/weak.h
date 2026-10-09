@@ -6,7 +6,7 @@
 typedef void (*gc_weak_drain_fn)(ant_t *js);
 typedef void (*gc_weak_mark_fn)(ant_t *js, ant_value_t value);
 typedef bool (*gc_weak_key_alive_fn)(ant_t *js, ant_value_t key);
-typedef bool (*gc_weak_collection_live_fn)(const ant_object_t *obj);
+typedef bool (*gc_weak_collection_live_fn)(ant_t *js, const ant_object_t *obj);
 
 bool js_symbol_gc_mark(ant_value_t sym, uint64_t epoch);
 bool js_symbol_gc_is_marked(ant_value_t sym, uint64_t epoch);

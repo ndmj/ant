@@ -368,6 +368,15 @@ typedarray_from_cleanup_test = executable(
 )
 test('typedarray-from-cleanup', typedarray_from_cleanup_test)
 
+symbol_iterator_isolates_test = executable(
+  'test-symbol-iterator-isolates',
+  files('tests/test_symbol_iterator_isolates.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('symbol-iterator-isolates', symbol_iterator_isolates_test)
+
 error_handoffs_test = executable(
   'test-error-handoffs',
   files('tests/test_error_handoffs.c'),
@@ -469,6 +478,96 @@ gc_uv_segments_test = executable(
   build_by_default: false
 )
 test('gc-uv-segments', gc_uv_segments_test)
+
+gc_array_cards_test = executable(
+  'test-gc-array-cards',
+  files('tests/test_gc_array_cards.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('gc-array-cards', gc_array_cards_test)
+
+code_unit_feedback_test = executable(
+  'test-code-unit-feedback',
+  files('tests/test_code_unit_feedback.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('code-unit-feedback', code_unit_feedback_test)
+
+code_unit_lifetime_test = executable(
+  'test-code-unit-lifetime',
+  files('tests/test_code_unit_lifetime.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('code-unit-lifetime', code_unit_lifetime_test)
+
+code_unit_ctor_proto_test = executable(
+  'test-code-unit-ctor-proto',
+  files('tests/test_code_unit_ctor_proto.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('code-unit-ctor-proto', code_unit_ctor_proto_test)
+
+ic_poly_shape_release_test = executable(
+  'test-ic-poly-shape-release',
+  files('tests/test_ic_poly_shape_release.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('ic-poly-shape-release', ic_poly_shape_release_test)
+
+gc_two_isolates_test = executable(
+  'test-gc-two-isolates',
+  files('tests/test_gc_two_isolates.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('gc-two-isolates', gc_two_isolates_test)
+
+isolate_code_arenas_test = executable(
+  'test-isolate-code-arenas',
+  files('tests/test_isolate_code_arenas.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('isolate-code-arenas', isolate_code_arenas_test)
+
+isolate_ic_epochs_test = executable(
+  'test-isolate-ic-epochs',
+  files('tests/test_isolate_ic_epochs.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('isolate-ic-epochs', isolate_ic_epochs_test)
+
+isolate_timers_test = executable(
+  'test-isolate-timers',
+  files('tests/test_isolate_timers.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('isolate-timers', isolate_timers_test)
+
+ic_identity_wrap_test = executable(
+  'test-ic-identity-wrap',
+  files('tests/test_ic_identity_wrap.c'),
+  dependencies: libant_dep,
+  c_args: ['-UNDEBUG'],
+  build_by_default: false
+)
+test('ic-identity-wrap', ic_identity_wrap_test)
 
 upvalue_close_order_test = executable(
   'test-upvalue-close-order',
@@ -573,12 +672,13 @@ executable(
   build_by_default: false
 )
 
-executable(
+http_protocols_test = executable(
   'test-http-protocols',
   files('tests/test_http_protocols.c'),
   dependencies: libant_dep,
   build_by_default: false
 )
+test('http-protocols', http_protocols_test)
 
 embed_example = get_option('embed_example')
 embed_example_dist = 'packages/libant/dist'

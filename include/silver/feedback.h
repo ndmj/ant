@@ -372,8 +372,15 @@ static inline void sv_tfb_ensure(sv_func_t *fn) {
 
 static inline void sv_tfb_record_call_target(sv_func_t *func, int bc_off, sv_func_t *callee) {
   if (!callee) return;
+  
+  if (__builtin_expect(callee->unit != NULL, 0)) {
+    if (!func->unit && !func->fb_unit_watched && !sv_code_units_watch_feedback(func, callee)) return;
+    func->fb_unit_target = true;
+  }
+  
   sv_call_target_fb_t *fb = func->call_target_fb;
   int count = func->call_target_fb_count;
+  
   for (int i = 0; i < count; i++) {
     if (fb[i].bc_off != (uint16_t)bc_off) continue;
     if (fb[i].disabled) return;
@@ -387,17 +394,42 @@ static inline void sv_tfb_record_call_target(sv_func_t *func, int bc_off, sv_fun
     func->tfb_version++;
     return;
   }
+  
   if (count >= SV_CALL_FB_MAX_SLOTS) return;
   if (!fb) {
     fb = calloc(SV_CALL_FB_MAX_SLOTS, sizeof(sv_call_target_fb_t));
     if (!fb) return;
     func->call_target_fb = fb;
   }
+  
   fb[count].bc_off = (uint16_t)bc_off;
   fb[count].target = callee;
   fb[count].miss_count = 0;
   fb[count].disabled = 0;
   func->call_target_fb_count = (uint8_t)(count + 1);
+}
+
+static constexpr uint8_t SV_TFB_CALLED_BUILTIN = 1u << 0;
+
+static inline void sv_tfb_record_builtin_call(sv_func_t *func, uint8_t *ip) {
+  uint8_t *type_feedback = sv_func_type_feedback(func);
+  if (!type_feedback) return;
+  
+  uint8_t *site = &type_feedback[ip - func->code];
+  if (*site & SV_TFB_CALLED_BUILTIN) return;
+  
+  *site |= SV_TFB_CALLED_BUILTIN;
+  func->tfb_version++;
+}
+
+static inline bool sv_tfb_call_site_may_call_builtin(sv_func_t *func, int bc_off) {
+  uint8_t *type_feedback = sv_func_type_feedback(func);
+  if (type_feedback && (type_feedback[bc_off] & SV_TFB_CALLED_BUILTIN)) return true;
+  
+  for (int i = 0; i < func->call_target_fb_count; i++)
+    if (func->call_target_fb[i].bc_off == (uint16_t)bc_off) return false;
+  
+  return true;
 }
 
 static inline sv_func_t *sv_tfb_get_call_target(sv_func_t *func, int bc_off) {

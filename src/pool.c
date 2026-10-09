@@ -1,5 +1,5 @@
-#include "internal.h"
 #include "gc.h"
+#include "internal.h"
 #include "gc/verify.h"
 
 #include <stddef.h>
@@ -199,6 +199,7 @@ static void *pool_bucket_alloc_fast(ant_pool_bucket_t *bucket, size_t class_size
   }
 
   if (!bucket->current || !bucket->cursor || bucket->cursor + bucket->slot_stride > bucket->end) {
+  bucket->blocks_taken++;
   if (bucket->free_head) {
     ant_pool_block_t *reuse = bucket->free_head;
     bucket->free_head = pool_free_next(reuse);
@@ -311,10 +312,10 @@ void *js_type_alloc(ant_t *js, ant_alloc_kind_t kind, size_t size, size_t align)
   if (align == 0) align = sizeof(void *);
 
   GC_VERIFY_STRESS(js);
-  js->gc_pool_alloc += size;
+  js->gc.pool_alloc += size;
   size_t pool_threshold = gc_pool_major_threshold(js);
   
-  if (js->gc_pool_alloc >= pool_threshold) gc_run(js);
+  if (js->gc.pool_alloc >= pool_threshold) gc_run(js);
   if (kind == ANT_ALLOC_STRING) return string_pool_alloc(js, size, align);
 
   ant_pool_t *pool = pool_for_kind(js, kind);
@@ -353,7 +354,7 @@ ant_rope_heap_t *js_rope_alloc(ant_t *js) {
   
   if (!rope) return NULL;
 
-  js->gc_pool_alloc += sizeof(ant_rope_heap_t);
+  js->gc.pool_alloc += sizeof(ant_rope_heap_t);
   js->rope_gc.young_alloc += sizeof(ant_rope_heap_t);
   
   return rope;

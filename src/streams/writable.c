@@ -9,7 +9,6 @@
 
 #include "gc/roots.h"
 #include "silver/call.h"
-#include "modules/symbol.h"
 #include "modules/assert.h"
 #include "modules/abort.h"
 #include "streams/writable.h"
@@ -23,12 +22,6 @@ bool ws_is_writer(ant_value_t obj) {
   return js_check_brand(obj, BRAND_WRITABLE_STREAM_WRITER)
     && vtype(js_get_slot(obj, SLOT_RS_CLOSED)) == kTypePromise
     && vtype(js_get_slot(obj, SLOT_WS_READY)) == kTypePromise;
-}
-
-bool ws_is_controller(ant_value_t obj) {
-  return js_check_brand(obj, BRAND_WRITABLE_STREAM_CONTROLLER)
-    && ws_get_controller(obj) != NULL
-    && ws_is_stream(js_get_slot(obj, SLOT_ENTRIES));
 }
 
 ws_stream_t *ws_get_stream(ant_value_t obj) {
@@ -144,6 +137,7 @@ static ant_value_t ws_ctrl_queue_shift(ant_t *js, ant_value_t ctrl_obj) {
   uint32_t new_len = aobj->u.array.len - 1;
   for (uint32_t i = 0; i < new_len; i++)
     aobj->u.array.data[i] = aobj->u.array.data[i + 1];
+  gc_elements_moved(aobj);
   aobj->u.array.len = new_len;
   return val;
 }
@@ -177,6 +171,7 @@ static ant_value_t ws_write_reqs_shift(ant_t *js, ant_value_t stream_obj) {
   uint32_t new_len = aobj->u.array.len - 1;
   for (uint32_t i = 0; i < new_len; i++)
     aobj->u.array.data[i] = aobj->u.array.data[i + 1];
+  gc_elements_moved(aobj);
   aobj->u.array.len = new_len;
   return val;
 }
@@ -1156,7 +1151,7 @@ void init_writable_stream_module(ant_t *js) {
   js_set_getter_desc(js, js->builtins.ws_controller_proto, "signal", 6, js_mkfun(js_ws_controller_get_signal), JS_DESC_C);
   js_set(js, js->builtins.ws_controller_proto, "error", js_mkfun(js_ws_controller_error));
   js_set_descriptor(js, js->builtins.ws_controller_proto, "error", 5, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.ws_controller_proto, get_toStringTag_sym(), js_mkstr(js, "WritableStreamDefaultController", 31));
+  js_set_sym(js, js->builtins.ws_controller_proto, js->sym.toStringTag_sym, js_mkstr(js, "WritableStreamDefaultController", 31));
 
   ant_value_t ctrl_ctor = js_make_ctor(js, js_ws_controller_ctor, js->builtins.ws_controller_proto, "WritableStreamDefaultController", 31);
   js_set(js, g, "WritableStreamDefaultController", ctrl_ctor);
@@ -1174,7 +1169,7 @@ void init_writable_stream_module(ant_t *js) {
   js_set_descriptor(js, js->builtins.ws_writer_proto, "releaseLock", 11, JS_DESC_W | JS_DESC_C);
   js_set(js, js->builtins.ws_writer_proto, "write", js_mkfun(js_ws_writer_write));
   js_set_descriptor(js, js->builtins.ws_writer_proto, "write", 5, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.ws_writer_proto, get_toStringTag_sym(), js_mkstr(js, "WritableStreamDefaultWriter", 27));
+  js_set_sym(js, js->builtins.ws_writer_proto, js->sym.toStringTag_sym, js_mkstr(js, "WritableStreamDefaultWriter", 27));
 
   ant_value_t writer_ctor = js_make_ctor(js, js_ws_writer_ctor, js->builtins.ws_writer_proto, "WritableStreamDefaultWriter", 27);
   js_set(js, g, "WritableStreamDefaultWriter", writer_ctor);
@@ -1188,7 +1183,7 @@ void init_writable_stream_module(ant_t *js) {
   js_set_descriptor(js, js->builtins.ws_proto, "close", 5, JS_DESC_W | JS_DESC_C);
   js_set(js, js->builtins.ws_proto, "getWriter", js_mkfun(js_ws_get_writer));
   js_set_descriptor(js, js->builtins.ws_proto, "getWriter", 9, JS_DESC_W | JS_DESC_C);
-  js_set_sym(js, js->builtins.ws_proto, get_toStringTag_sym(), js_mkstr(js, "WritableStream", 14));
+  js_set_sym(js, js->builtins.ws_proto, js->sym.toStringTag_sym, js_mkstr(js, "WritableStream", 14));
 
   ant_value_t ws_ctor = js_make_ctor(js, js_ws_ctor, js->builtins.ws_proto, "WritableStream", 14);
   js_set(js, g, "WritableStream", ws_ctor);

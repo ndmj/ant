@@ -1,12 +1,19 @@
 #include "shapes.h"
+#include "ant.h"
+#include "isolate.h"
 #include "hash.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <uthash.h>
 
-uint32_t ant_ic_epoch_counter = 1;
-uint32_t ant_ic_obj_epoch_counter = 1;
+void ant_ic_epoch_bump(ant_t *js) {
+  if (++js->ic.epoch == 0) js->ic.epoch = 1;
+}
+
+void ant_ic_obj_epoch_bump(ant_t *js) {
+  if (++js->ic.obj_epoch == 0) js->ic.obj_epoch = 1;
+}
 
 static size_t g_shape_bytes          = 0;
 static size_t g_shape_entry_pool_len = 0;
@@ -95,7 +102,8 @@ struct ant_shape {
   ant_shape_prop_t *props;
   shape_index_entry_t *index;
   uint32_t index_mask;
-  uint32_t jit_invalid;
+  bool jit_snapshot;
+  bool may_have_index_keys;
   uint64_t first_child_key;
   ant_shape_t *first_child;
   shape_child_entry_t *children;
@@ -366,7 +374,7 @@ static bool shape_prepare_append(ant_shape_t *shape) {
 }
 
 static bool shape_prepare_metadata_write(ant_shape_t *shape) {
-  shape->jit_invalid = 1;
+  ANT_ASSERT(!shape->jit_snapshot, "snapshotted shape metadata written in place");
   shape_reclaim_descriptor_tail(shape->descriptors);
   
   return (
@@ -376,7 +384,7 @@ static bool shape_prepare_metadata_write(ant_shape_t *shape) {
 }
 
 static bool shape_add_key(
-  ant_shape_t *shape,
+  ant_t *js, ant_shape_t *shape,
   ant_shape_key_type_t type,
   const char *interned,
   ant_offset_t sym_off,
@@ -394,7 +402,7 @@ static bool shape_add_key(
     if (shape->props[slot].attrs != attrs) {
       if (!shape_prepare_metadata_write(shape)) return false;
       shape->props[slot].attrs = attrs;
-      ant_ic_epoch_bump();
+      ant_ic_epoch_bump(js);
     }
     if (out_slot) *out_slot = slot;
     return true;
@@ -415,7 +423,10 @@ static bool shape_add_key(
   if (type == ANT_SHAPE_KEY_SYMBOL) {
     prop->key.sym_off = sym_off;
     shape->descriptors->may_have_gc_refs = true;
-  } else prop->key.interned = interned;
+  } else {
+    prop->key.interned = interned;
+    if (interned[0] >= '0' && interned[0] <= '9') shape->may_have_index_keys = true;
+  }
 
   if (!shape_index_add(shape, key, slot)) {
     shape->count--;
@@ -490,20 +501,21 @@ static ant_shape_t *shape_copy_for_transition(const ant_shape_t *shape) {
   copy->ref_count = 1;
   copy->count = shape->count;
   copy->inobj_limit = shape->inobj_limit;
+  copy->may_have_index_keys = shape->may_have_index_keys;
   shape->descriptors->ref_count++;
   shape_link_descriptors(copy, shape->descriptors);
   return copy;
 }
 
 static bool shape_add_tr(
-  ant_shape_t **shape_pp, ant_shape_key_type_t type, const char *interned,
+  ant_t *js, ant_shape_t **shape_pp, ant_shape_key_type_t type, const char *interned,
   ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot, uint32_t max_tree_props
 ) {
   ant_shape_t *shape = *shape_pp;
   
   if (!shape) return false;
   if (!shape_is_in_tree(shape))
-    return shape_add_key(shape, type, interned, sym_off, attrs, out_slot);
+    return shape_add_key(js, shape, type, interned, sym_off, attrs, out_slot);
   
   uint64_t prop_key = type == ANT_SHAPE_KEY_SYMBOL
     ? shape_key_symbol(sym_off) : shape_key_interned(interned);
@@ -522,7 +534,7 @@ static bool shape_add_tr(
   if (shape->bulk_layout || shape->count >= max_tree_props) {
     ant_shape_t *copy = shape_clone_reserve(shape, 1);
     if (!copy) return false;
-    if (!shape_add_key(copy, type, interned, sym_off, attrs, out_slot)) {
+    if (!shape_add_key(js, copy, type, interned, sym_off, attrs, out_slot)) {
       ant_shape_release(copy);
       return false;
     }
@@ -533,7 +545,7 @@ static bool shape_add_tr(
 
   ant_shape_t *shared = shape_copy_for_transition(shape);
   if (!shared) return false;
-  if (!shape_add_key(shared, type, interned, sym_off, attrs, out_slot)) {
+  if (!shape_add_key(js, shared, type, interned, sym_off, attrs, out_slot)) {
     ant_shape_release(shared);
     return false;
   }
@@ -545,20 +557,20 @@ static bool shape_add_tr(
   return true;
 }
 
-bool ant_shape_add_interned_tr(ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot) {
-  return shape_add_tr(shape_pp, ANT_SHAPE_KEY_STRING, interned, 0, attrs, out_slot, SHAPE_TRANSITION_MAX_PROPS);
+bool ant_shape_add_interned_tr(ant_t *js, ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot) {
+  return shape_add_tr(js, shape_pp, ANT_SHAPE_KEY_STRING, interned, 0, attrs, out_slot, SHAPE_TRANSITION_MAX_PROPS);
 }
 
-bool ant_shape_add_interned_keyed_tr(ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot) {
-  return shape_add_tr(shape_pp, ANT_SHAPE_KEY_STRING, interned, 0, attrs, out_slot, SHAPE_KEYED_TRANSITION_MAX_PROPS);
+bool ant_shape_add_interned_keyed_tr(ant_t *js, ant_shape_t **shape_pp, const char *interned, uint8_t attrs, uint32_t *out_slot) {
+  return shape_add_tr(js, shape_pp, ANT_SHAPE_KEY_STRING, interned, 0, attrs, out_slot, SHAPE_KEYED_TRANSITION_MAX_PROPS);
 }
 
-bool ant_shape_add_symbol_tr(ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot) {
-  return shape_add_tr(shape_pp, ANT_SHAPE_KEY_SYMBOL, NULL, sym_off, attrs, out_slot, SHAPE_TRANSITION_MAX_PROPS);
+bool ant_shape_add_symbol_tr(ant_t *js, ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot) {
+  return shape_add_tr(js, shape_pp, ANT_SHAPE_KEY_SYMBOL, NULL, sym_off, attrs, out_slot, SHAPE_TRANSITION_MAX_PROPS);
 }
 
-bool ant_shape_add_symbol_keyed_tr(ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot) {
-  return shape_add_tr(shape_pp, ANT_SHAPE_KEY_SYMBOL, NULL, sym_off, attrs, out_slot, SHAPE_KEYED_TRANSITION_MAX_PROPS);
+bool ant_shape_add_symbol_keyed_tr(ant_t *js, ant_shape_t **shape_pp, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot) {
+  return shape_add_tr(js, shape_pp, ANT_SHAPE_KEY_SYMBOL, NULL, sym_off, attrs, out_slot, SHAPE_KEYED_TRANSITION_MAX_PROPS);
 }
 
 ant_shape_t *ant_shape_new_with_inobj_limit(uint8_t inobj_limit) {
@@ -599,6 +611,7 @@ ant_shape_t *shape_clone_reserve(const ant_shape_t *shape, uint32_t extra) {
   copy->deleted_count = shape->deleted_count;
   copy->inobj_limit = shape_clamp_inobj_limit(shape->inobj_limit);
   copy->bulk_layout = shape->bulk_layout;
+  copy->may_have_index_keys = shape->may_have_index_keys;
 
   return copy;
 }
@@ -620,9 +633,24 @@ size_t ant_shape_storage_bytes(const ant_shape_t *shape) {
     (descriptors->index ? (size_t)(descriptors->index_mask + 1) * sizeof(*descriptors->index) : 0);
 }
 
+void ant_shape_mark_jit_snapshot(ant_shape_t *shape) {
+  if (shape) shape->jit_snapshot = true;
+}
+
 bool ant_shape_is_shared(const ant_shape_t *shape) {
   return shape && (shape->ref_count > 1 || shape->descriptors->ref_count > 1);
 }
+
+static_assert(
+  offsetof(struct ant_shape, ref_count) == ANT_SHAPE_REF_COUNT_OFFSET &&
+  sizeof(((struct ant_shape *)0)->ref_count) == 4,
+  "compiled code updates shape reference counts at this offset"
+);
+
+static_assert(
+  offsetof(struct ant_shape, may_have_index_keys) == ANT_SHAPE_INDEX_KEYS_OFFSET,
+  "ant_shape_may_have_index_keys reads the flag at this offset"
+);
 
 void ant_shape_retain(ant_shape_t *shape) {
   if (!shape) return;
@@ -729,10 +757,6 @@ uint8_t ant_shape_get_inobj_limit(const ant_shape_t *shape) {
   return shape_clamp_inobj_limit(shape->inobj_limit);
 }
 
-const uint32_t *ant_shape_jit_guard(const ant_shape_t *shape) {
-  return shape ? &shape->jit_invalid : NULL;
-}
-
 int32_t ant_shape_lookup_interned(const ant_shape_t *shape, const char *interned) {
   shape_index_entry_t *entry = shape_lookup(shape, shape_key_interned(interned));
   return entry ? (int32_t)entry->slot : -1;
@@ -743,15 +767,11 @@ int32_t ant_shape_lookup_symbol(const ant_shape_t *shape, ant_offset_t sym_off) 
   return entry ? (int32_t)entry->slot : -1;
 }
 
-bool ant_shape_add_interned(ant_shape_t *shape, const char *interned, uint8_t attrs, uint32_t *out_slot) {
-  return shape_add_key(shape, ANT_SHAPE_KEY_STRING, interned, 0, attrs, out_slot);
+bool ant_shape_add_interned(ant_t *js, ant_shape_t *shape, const char *interned, uint8_t attrs, uint32_t *out_slot) {
+  return shape_add_key(js, shape, ANT_SHAPE_KEY_STRING, interned, 0, attrs, out_slot);
 }
 
-bool ant_shape_add_symbol(ant_shape_t *shape, ant_offset_t sym_off, uint8_t attrs, uint32_t *out_slot) {
-  return shape_add_key(shape, ANT_SHAPE_KEY_SYMBOL, NULL, sym_off, attrs, out_slot);
-}
-
-bool ant_shape_remove_slot(ant_shape_t *shape, uint32_t slot) {
+bool ant_shape_remove_slot(ant_t *js, ant_shape_t *shape, uint32_t slot) {
   if (!shape || slot >= shape->count) return false;
   if (!shape_prepare_metadata_write(shape)) return false;
 
@@ -778,7 +798,7 @@ bool ant_shape_remove_slot(ant_shape_t *shape, uint32_t slot) {
   }
   shape->descriptors->count = shape->count;
   
-  ant_ic_epoch_bump();
+  ant_ic_epoch_bump(js);
   return true;
 }
 
@@ -839,21 +859,21 @@ ant_shape_prop_t *ant_shape_prop_mut_at(ant_shape_t *shape, uint32_t slot) {
   return &shape->props[slot];
 }
 
-bool ant_shape_set_attrs_interned(ant_shape_t *shape, const char *interned, uint8_t attrs) {
+bool ant_shape_set_attrs_interned(ant_t *js, ant_shape_t *shape, const char *interned, uint8_t attrs) {
   int32_t slot = ant_shape_lookup_interned(shape, interned);
   if (slot < 0) return false;
   if (!shape_prepare_metadata_write(shape)) return false;
   shape->props[(uint32_t)slot].attrs = attrs;
-  ant_ic_epoch_bump();
+  ant_ic_epoch_bump(js);
   return true;
 }
 
-bool ant_shape_set_attrs_symbol(ant_shape_t *shape, ant_offset_t sym_off, uint8_t attrs) {
+bool ant_shape_set_attrs_symbol(ant_t *js, ant_shape_t *shape, ant_offset_t sym_off, uint8_t attrs) {
   int32_t slot = ant_shape_lookup_symbol(shape, sym_off);
   if (slot < 0) return false;
   if (!shape_prepare_metadata_write(shape)) return false;
   shape->props[(uint32_t)slot].attrs = attrs;
-  ant_ic_epoch_bump();
+  ant_ic_epoch_bump(js);
   return true;
 }
 
@@ -862,13 +882,13 @@ uint8_t ant_shape_get_attrs(const ant_shape_t *shape, uint32_t slot) {
   return prop ? prop->attrs : ANT_PROP_ATTR_DEFAULT;
 }
 
-bool ant_shape_clear_accessor_slot(ant_shape_t *shape, uint32_t slot) {
+bool ant_shape_clear_accessor_slot(ant_t *js, ant_shape_t *shape, uint32_t slot) {
   ant_shape_prop_t *prop = ant_shape_prop_mut_at(shape, slot);
   if (!prop) return false;
   prop->has_getter = 0;
   prop->has_setter = 0;
   prop->getter = 0;
   prop->setter = 0;
-  ant_ic_epoch_bump();
+  ant_ic_epoch_bump(js);
   return true;
 }

@@ -1,4 +1,5 @@
 #include "ant.h"
+#include "builder.h"
 #include "errors.h"
 #include "esm/exports.h"
 #include "esm/loader.h"
@@ -18,10 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-bool io_no_color = true;
-
-#define ANT_WASM_GC_STUB(name) \
-  void name(ant_t *js, gc_mark_fn mark) { (void)js; (void)mark; }
+// TODO: cleanup
+#define ANT_WASM_GC_STUB(name) void name(ant_t *js, gc_mark_fn mark) { (void)js; (void)mark; }
 
 ANT_WASM_GC_STUB(gc_mark_cron)
 ANT_WASM_GC_STUB(gc_mark_atomics)
@@ -344,7 +343,6 @@ static bool ant_wasm_drain_microtasks(
   if (check_rejections && !interrupted) js_check_unhandled_rejections(js);
   js->microtasks_draining = false;
   if (at_job_boundary) gc_weak_clear_kept_alive(js);
-  reap_retired_coroutines(js);
   return true;
 }
 
@@ -360,9 +358,12 @@ bool js_maybe_drain_microtasks_after_async_settle(ant_t *js) {
   return ant_wasm_drain_microtasks(js, false, false);
 }
 
-int has_pending_microtasks(void) {
+int has_pending_microtasks(ant_t *js) {
+  (void)js;
   return ant_wasm_microtasks.head != NULL;
 }
+
+void cleanup_timer_module(ant_t *js) { (void)js; }
 
 void gc_mark_timers(ant_t *js, gc_mark_fn mark) {
   ant_wasm_microtask_t *lists[] = {
@@ -445,5 +446,3 @@ int crypto_fill_random(void *buf, size_t len) {
   if (len > UINT32_MAX) return -1;
   return ant_wasm_random_fill(buf, (uint32_t)len);
 }
-
-void init_async_iterator_helpers(ant_t *js) { (void)js; }

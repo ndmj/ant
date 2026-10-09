@@ -108,6 +108,7 @@ jit_value_info_t vstack_value_info(const jit_vstack_t *vs, int idx) {
     info.known_const = vs->known_const[idx];
   }
   if (vs->known_bool) info.known_bool = vs->known_bool[idx];
+  if (vs->known_builtin) info.known_builtin = vs->known_builtin[idx];
   if (vs->integer_range) info.integer_range = vs->integer_range[idx];
   return info;
 }
@@ -120,6 +121,7 @@ void vstack_set_value_info(
     if (info.has_const) vs->known_const[idx] = info.known_const;
   }
   if (vs->known_bool) vs->known_bool[idx] = info.known_bool;
+  if (vs->known_builtin) vs->known_builtin[idx] = info.known_builtin;
   if (vs->integer_range) vs->integer_range[idx] = info.integer_range;
 }
 
@@ -300,6 +302,205 @@ void jit_entry_integer_ranges(
   free(state);
 }
 
+static bool jit_reads_slot(const uint8_t *ip, bool arg, int index) {
+  if (!ip) return false;
+  if (arg) return *ip == OP_GET_ARG && sv_get_u16(ip + 1) == index;
+  if (*ip == OP_GET_LOCAL) return sv_get_u16(ip + 1) == index;
+  return *ip == OP_GET_LOCAL8 && sv_get_u8(ip + 1) == index;
+}
+
+static int jit_constant_step(sv_func_t *func, uint8_t *ip) {
+  jit_integer_range_t k = jit_constant_integer_range(func, ip);
+  return k.known && k.min != 0 && k.min >= -511 && k.min <= 511 ? (int)k.min : 0;
+}
+
+static int jit_counter_step(
+    sv_func_t *func, const uint8_t *target, const uint8_t *store,
+    uint8_t *const back[3], bool arg, int index) {
+  uint8_t *p1 = back[0], *p2 = back[1], *p3 = back[2];
+  if (!p1 || target[store - func->code] || target[p1 - func->code]) return 0;
+  switch (*p1) {
+    case OP_INC: case OP_POST_INC:
+      return jit_reads_slot(p2, arg, index) ? 1 : 0;
+    case OP_DEC: case OP_POST_DEC:
+      return jit_reads_slot(p2, arg, index) ? -1 : 0;
+    case OP_ADD: case OP_ADD_NUM: case OP_SUB: case OP_SUB_NUM: {
+      if (!p2 || !p3 || target[p2 - func->code]) return 0;
+      bool sub = *p1 == OP_SUB || *p1 == OP_SUB_NUM;
+      if (jit_reads_slot(p3, arg, index)) {
+        int k = jit_constant_step(func, p2);
+        return sub ? -k : k;
+      }
+      return !sub && jit_reads_slot(p2, arg, index) ? jit_constant_step(func, p3) : 0;
+    }
+    default:
+      return 0;
+  }
+}
+
+void jit_induction_locals(sv_func_t *func, uint8_t *kinds, int n_locals, int param_count) {
+  enum { UNSEEN, NONNEG, SIGNED, REJECTED };
+  uint8_t *state = calloc((size_t)n_locals, 1);
+  uint8_t *target = calloc((size_t)func->code_len + 1, 1);
+  int *copy_dst = NULL, *copy_src = NULL;
+  int copies = 0, copy_cap = 0;
+  if (!state || !target) goto none;
+
+  uint8_t *end = func->code + func->code_len;
+  for (uint8_t *ip = func->code; ip < end;) {
+    sv_op_t op = (sv_op_t)*ip;
+    int size = sv_op_size[op];
+    if (!size || ip + size > end) goto none;
+    uint16_t flags = sv_op_flags[op];
+    int64_t to = -1;
+    if (flags & SV_OPF_JIT_BRANCH32) to = (ip - func->code) + size + sv_get_i32(ip + 1);
+    else if (flags & SV_OPF_JIT_BRANCH8) to = (ip - func->code) + size + sv_get_i8(ip + 1);
+    if (to >= 0 && to <= func->code_len) target[to] = 1;
+    ip += size;
+  }
+
+  uint8_t *back[3] = {0};
+  for (uint8_t *ip = func->code; ip < end;) {
+    sv_op_t op = (sv_op_t)*ip;
+    int size = sv_op_size[op];
+    if (!size || ip + size > end || op == OP_PUT_LOCAL_CHK) goto none;
+    uint8_t *previous = back[0];
+
+    int index = -1;
+    uint8_t kind = REJECTED;
+    switch (op) {
+      case OP_PUT_LOCAL: case OP_SET_LOCAL: case OP_PUT_LOCAL8: case OP_SET_LOCAL8: {
+        bool short_op = op == OP_PUT_LOCAL8 || op == OP_SET_LOCAL8;
+        index = short_op ? sv_get_u8(ip + 1) : sv_get_u16(ip + 1);
+        if (index >= n_locals || !previous || target[ip - func->code]) break;
+        int step = jit_counter_step(func, target, ip, back, false, index);
+        if (step) {
+          kind = step > 0 ? UNSEEN : SIGNED;
+          break;
+        }
+        jit_integer_range_t constant = jit_constant_integer_range(func, previous);
+        if (constant.known) {
+          kind = constant.min >= 0 ? NONNEG : SIGNED;
+          break;
+        }
+        sv_op_t prev_op = (sv_op_t)*previous;
+        if (prev_op != OP_GET_LOCAL && prev_op != OP_GET_LOCAL8) break;
+        int source = prev_op == OP_GET_LOCAL8 ? sv_get_u8(previous + 1) : sv_get_u16(previous + 1);
+        if (source >= n_locals) break;
+        if (copies == copy_cap) {
+          copy_cap = copy_cap ? copy_cap * 2 : 16;
+          int *dst = realloc(copy_dst, (size_t)copy_cap * sizeof(int));
+          if (dst) copy_dst = dst;
+          int *src = realloc(copy_src, (size_t)copy_cap * sizeof(int));
+          if (src) copy_src = src;
+          if (!dst || !src) goto none;
+        }
+        copy_dst[copies] = index;
+        copy_src[copies++] = source;
+        kind = UNSEEN;
+        break;
+      }
+      case OP_INC_LOCAL:
+        index = sv_get_u8(ip + 1);
+        kind = UNSEEN;
+        break;
+      case OP_DEC_LOCAL:
+        index = sv_get_u8(ip + 1);
+        kind = SIGNED;
+        break;
+      case OP_ADD_LOCAL: {
+        index = sv_get_u8(ip + 1);
+        int step = previous && !target[ip - func->code] ? jit_constant_step(func, previous) : 0;
+        if (step) kind = step > 0 ? UNSEEN : SIGNED;
+        break;
+      }
+      case OP_YIELD_STAR_INIT: case OP_YIELD_STAR_NEXT:
+      case OP_YIELD_STAR_THROW: case OP_YIELD_STAR_RETURN:
+        index = sv_get_u16(ip + 1);
+        break;
+      default:
+        if (sv_op_flags[op] & SV_OPF_BUILDER_TARGET)
+          index = (int)sv_get_u16(ip + 1) - param_count;
+        break;
+    }
+    if (index >= 0 && index < n_locals && kind > state[index]) state[index] = kind;
+    back[2] = back[1];
+    back[1] = back[0];
+    back[0] = ip;
+    ip += size;
+  }
+
+  // a copy is as good as its source; repeat until no copy weakens a local
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (int i = 0; i < copies; i++) {
+      uint8_t from = state[copy_src[i]] == UNSEEN ? REJECTED : state[copy_src[i]];
+      if (from > state[copy_dst[i]]) {
+        state[copy_dst[i]] = from;
+        changed = true;
+      }
+    }
+  }
+  for (int i = 0; i < n_locals; i++)
+    kinds[i] = state[i] == NONNEG ? JIT_INDUCTION_NONNEG : state[i] == SIGNED ? JIT_INDUCTION_SIGNED : 0;
+
+none:
+  free(copy_dst);
+  free(copy_src);
+  free(target);
+  free(state);
+}
+
+uint8_t jit_induction_params(sv_func_t *func, int param_count) {
+  if (func->has_dynamic_eval || param_count <= 0) return 0;
+  uint8_t *target = calloc((size_t)func->code_len + 1, 1);
+  
+  if (!target) return 0;
+  uint8_t *end = func->code + func->code_len;
+  uint8_t ok = 0, bad = 0;
+  
+  for (uint8_t *ip = func->code; ip < end;) {
+    sv_op_t op = (sv_op_t)*ip;
+    int size = sv_op_size[op];
+    if (!size || ip + size > end) goto none;
+    uint16_t flags = sv_op_flags[op];
+    int64_t to = -1;
+    if (flags & SV_OPF_JIT_BRANCH32) to = (ip - func->code) + size + sv_get_i32(ip + 1);
+    else if (flags & SV_OPF_JIT_BRANCH8) to = (ip - func->code) + size + sv_get_i8(ip + 1);
+    if (to >= 0 && to <= func->code_len) target[to] = 1;
+    if (op == OP_SPECIAL_OBJ && sv_get_u8(ip + 1) == SV_SPECIAL_ARGUMENTS) goto none;
+    ip += size;
+  }
+
+  uint8_t *back[3] = {0};
+  for (uint8_t *ip = func->code; ip < end; ip += sv_op_size[*ip]) {
+    sv_op_t op = (sv_op_t)*ip;
+    int index = -1;
+    bool counted = false;
+    
+    if (op == OP_PUT_ARG || op == OP_SET_ARG) {
+      index = sv_get_u16(ip + 1);
+      counted = jit_counter_step(func, target, ip, back, true, index) != 0;
+    } else if (sv_op_flags[op] & SV_OPF_BUILDER_TARGET) index = sv_get_u16(ip + 1);
+
+    if (index >= 0 && index < param_count && index < JIT_PARAM_HOIST_CAP) {
+      if (counted) ok |= (uint8_t)(1u << index);
+      else bad |= (uint8_t)(1u << index);
+    }
+    
+    back[2] = back[1];
+    back[1] = back[0];
+    back[0] = ip;
+  }
+  
+  free(target);
+  return ok & (uint8_t)~(bad | func->jit_param_counters_off);
+
+none:
+  free(target);
+  return 0;
+}
+
 bool jit_emit_integer_arithmetic(
     MIR_context_t ctx, MIR_item_t fn, jit_vstack_t *vs, sv_op_t op) {
   int li = vs->sp - 2, ri = vs->sp - 1;
@@ -466,10 +667,10 @@ void mir_d_to_i64(MIR_context_t ctx, MIR_item_t fn,
 }
 
 void mir_emit_get_length(
-    MIR_context_t ctx, MIR_item_t fn,
+    MIR_context_t ctx, MIR_item_t fn, ant_t *js,
     MIR_reg_t obj, MIR_reg_t dst,
-    MIR_reg_t r_vm, MIR_reg_t r_js, MIR_reg_t r_d_slot,
-    MIR_item_t helper1_proto, MIR_item_t imp_get_length,
+    MIR_reg_t r_js, MIR_reg_t r_d_slot,
+    MIR_item_t get_length_proto, MIR_item_t imp_get_length,
     bool builder_slot,
     int owner_id, int bc_off) {
   char tag_name[48], ptr_name[48], len_name[48], dbl_name[48];
@@ -602,6 +803,23 @@ void mir_emit_get_length(
   mir_emit_decode_ref(ctx, fn, ptr, obj);
   MIR_append_insn(ctx, fn,
                   MIR_new_insn(ctx, MIR_MOV,
+                               MIR_new_reg_op(ctx, tag),
+                               MIR_new_mem_op(ctx, MIR_T_U8,
+                                              (MIR_disp_t)ANT_OBJECT_FLAGS_HIGH_BYTE, ptr, 0, 1)));
+  ant_shape_t *arguments_shapes[2] = {0};
+  if (js) {
+    ant_value_t templates[2] = {js->builtins.arguments_iter_template, js->builtins.sloppy_arguments_iter_template};
+    for (int i = 0; i < 2; i++)
+      if (vtype(templates[i]) == kTypeObject) arguments_shapes[i] = js_obj_ptr(templates[i])->shape;
+  }
+  MIR_label_t arguments = arguments_shapes[0] || arguments_shapes[1] ? MIR_new_label(ctx) : slow;
+  MIR_append_insn(ctx, fn,
+                  MIR_new_insn(ctx, MIR_UBGE,
+                               MIR_new_label_op(ctx, arguments),
+                               MIR_new_reg_op(ctx, tag),
+                               MIR_new_uint_op(ctx, ANT_OBJECT_FLAG_ARGUMENTS >> 8)));
+  MIR_append_insn(ctx, fn,
+                  MIR_new_insn(ctx, MIR_MOV,
                                MIR_new_reg_op(ctx, len),
                                MIR_new_mem_op(ctx, MIR_T_U32,
                                               (MIR_disp_t)offsetof(ant_object_t, u.array.len), ptr, 0, 1)));
@@ -615,13 +833,39 @@ void mir_emit_get_length(
   MIR_append_insn(ctx, fn,
                   MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, done)));
 
+  if (arguments != slow) {
+    MIR_label_t template_hit = MIR_new_label(ctx);
+    MIR_append_insn(ctx, fn, arguments);
+    MIR_append_insn(ctx, fn,
+                    MIR_new_insn(ctx, MIR_MOV,
+                                 MIR_new_reg_op(ctx, tag),
+                                 MIR_new_mem_op(ctx, MIR_T_P, (MIR_disp_t)offsetof(ant_object_t, shape), ptr, 0, 1)));
+    for (int i = 0; i < 2; i++) {
+      if (!arguments_shapes[i]) continue;
+      mir_load_imm(ctx, fn, len, (uint64_t)(uintptr_t)arguments_shapes[i]);
+      MIR_append_insn(ctx, fn,
+                      MIR_new_insn(ctx, MIR_BEQ,
+                                   MIR_new_label_op(ctx, template_hit),
+                                   MIR_new_reg_op(ctx, tag),
+                                   MIR_new_reg_op(ctx, len)));
+    }
+    MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, slow)));
+    MIR_append_insn(ctx, fn, template_hit);
+    MIR_append_insn(ctx, fn,
+                    MIR_new_insn(ctx, MIR_MOV,
+                                 MIR_new_reg_op(ctx, dst),
+                                 MIR_new_mem_op(ctx, MIR_JSVAL,
+                                                (MIR_disp_t)(offsetof(ant_object_t, inobj) + ANT_ARGUMENTS_SLOT_LENGTH * sizeof(ant_value_t)),
+                                                ptr, 0, 1)));
+    MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, done)));
+  }
+
   MIR_append_insn(ctx, fn, slow);
   MIR_append_insn(ctx, fn,
-                  MIR_new_call_insn(ctx, 6,
-                                    MIR_new_ref_op(ctx, helper1_proto),
+                  MIR_new_call_insn(ctx, 5,
+                                    MIR_new_ref_op(ctx, get_length_proto),
                                     MIR_new_ref_op(ctx, imp_get_length),
                                     MIR_new_reg_op(ctx, dst),
-                                    MIR_new_reg_op(ctx, r_vm),
                                     MIR_new_reg_op(ctx, r_js),
                                     MIR_new_reg_op(ctx, obj)));
   MIR_append_insn(ctx, fn, done);
@@ -969,7 +1213,8 @@ MIR_reg_t mir_emit_known_array_index_guard(
 MIR_reg_t mir_emit_dense_element_guard(
     MIR_context_t ctx, MIR_item_t fn,
     MIR_reg_t object, MIR_reg_t index, MIR_reg_t value,
-    jit_element_access_t access, MIR_label_t slow, int site) {
+    jit_element_access_t access, MIR_label_t slow, int site,
+    jit_dense_element_t *element) {
   bool writable = access == JIT_ELEMENT_WRITE;
   char tag_name[48], ptr_name[48], flags_name[48];
   char data_name[48], len_name[48];
@@ -1028,9 +1273,10 @@ MIR_reg_t mir_emit_dense_element_guard(
                                MIR_new_reg_op(ctx, len),
                                MIR_new_mem_op(ctx, MIR_T_U32,
                                               (MIR_disp_t)offsetof(ant_object_t, u.array.len), ptr, 0, 1)));
+  MIR_label_t past_end = element && element->past_end ? element->past_end : slow;
   MIR_append_insn(ctx, fn,
                   MIR_new_insn(ctx, MIR_UBGE,
-                               MIR_new_label_op(ctx, slow),
+                               MIR_new_label_op(ctx, past_end),
                                MIR_new_reg_op(ctx, index),
                                MIR_new_reg_op(ctx, len)));
   MIR_append_insn(ctx, fn,
@@ -1045,7 +1291,110 @@ MIR_reg_t mir_emit_dense_element_guard(
         MIR_new_uint_op(ctx, ANT_SENTINEL_TAG)));
   }
 
+  if (element) {
+    element->ptr = ptr;
+    element->flags = flags;
+    element->len = len;
+  }
   return data;
+}
+
+uint8_t jit_math_field_builtin(uint8_t receiver, const char *name, uint32_t len) {
+  if (receiver != JIT_BUILTIN_MATH) return JIT_BUILTIN_UNKNOWN;
+  for (int i = 0; i < ANT_MATH_INTRINSIC_COUNT; i++)
+    if (strlen(ant_math_intrinsic_names[i]) == len && memcmp(name, ant_math_intrinsic_names[i], len) == 0)
+      return (uint8_t)(JIT_BUILTIN_MATH_FN + i);
+  return JIT_BUILTIN_UNKNOWN;
+}
+
+MIR_label_t mir_emit_math_call(MIR_context_t ctx, MIR_item_t fn, const jit_math_call_t *call) {
+  bool binary = call->kind >= ANT_MATH_FIRST_BINARY;
+  MIR_label_t slow = MIR_new_label(ctx);
+  MIR_label_t done = MIR_new_label(ctx);
+
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, call->scratch),
+      MIR_new_mem_op(ctx, MIR_JSVAL,
+                     (MIR_disp_t)(offsetof(ant_t, sym.math_fns) + (size_t)call->kind * sizeof(ant_value_t)),
+                     call->r_js, 0, 1)));
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_BNE, MIR_new_label_op(ctx, slow),
+      MIR_new_reg_op(ctx, call->callee), MIR_new_reg_op(ctx, call->scratch)));
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_UBGT, MIR_new_label_op(ctx, slow),
+      MIR_new_reg_op(ctx, call->a), MIR_new_uint_op(ctx, NANBOX_PREFIX)));
+  if (binary)
+    MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_UBGT, MIR_new_label_op(ctx, slow),
+        MIR_new_reg_op(ctx, call->b), MIR_new_uint_op(ctx, NANBOX_PREFIX)));
+
+  if (call->kind == ANT_MATH_ABS) {
+    // clearing the sign bit keeps the canonical NaN canonical
+    MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_AND, MIR_new_reg_op(ctx, call->result),
+        MIR_new_reg_op(ctx, call->a), MIR_new_uint_op(ctx, UINT64_C(0x7fffffffffffffff))));
+  } else {
+    char name[48];
+    snprintf(name, sizeof(name), "math_a_%d", call->site);
+    MIR_reg_t da = MIR_new_func_reg(ctx, fn->u.func, MIR_T_D, name);
+    snprintf(name, sizeof(name), "math_b_%d", call->site);
+    MIR_reg_t db = MIR_new_func_reg(ctx, fn->u.func, MIR_T_D, name);
+    snprintf(name, sizeof(name), "math_r_%d", call->site);
+    MIR_reg_t dr = MIR_new_func_reg(ctx, fn->u.func, MIR_T_D, name);
+    mir_i64_to_d(ctx, fn, da, call->a, call->r_d_slot);
+    if (binary) {
+      mir_i64_to_d(ctx, fn, db, call->b, call->r_d_slot);
+      MIR_append_insn(ctx, fn,
+                      MIR_new_call_insn(ctx, 5,
+                                        MIR_new_ref_op(ctx, call->math2_proto),
+                                        MIR_new_ref_op(ctx, call->imp_math[call->kind]),
+                                        MIR_new_reg_op(ctx, dr),
+                                        MIR_new_reg_op(ctx, da),
+                                        MIR_new_reg_op(ctx, db)));
+    } else {
+      MIR_append_insn(ctx, fn,
+                      MIR_new_call_insn(ctx, 4,
+                                        MIR_new_ref_op(ctx, call->math1_proto),
+                                        MIR_new_ref_op(ctx, call->imp_math[call->kind]),
+                                        MIR_new_reg_op(ctx, dr),
+                                        MIR_new_reg_op(ctx, da)));
+    }
+    mir_d_to_i64(ctx, fn, call->result, dr, call->r_d_slot);
+  }
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_JMP, MIR_new_label_op(ctx, done)));
+  MIR_append_insn(ctx, fn, slow);
+  return done;
+}
+
+void mir_emit_array_add_guard(
+    MIR_context_t ctx, MIR_item_t fn, MIR_reg_t r_js,
+    MIR_reg_t ptr, MIR_reg_t flags, MIR_label_t slow, int site) {
+  char name[48];
+  snprintf(name, sizeof(name), "add_t_%d", site);
+  MIR_reg_t t = MIR_new_func_reg(ctx, fn->u.func, MIR_T_I64, name);
+  snprintf(name, sizeof(name), "add_ap_%d", site);
+  MIR_reg_t ap = MIR_new_func_reg(ctx, fn->u.func, MIR_T_I64, name);
+
+#define LOAD(dst, type, disp, base) \
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_MOV, MIR_new_reg_op(ctx, dst), \
+      MIR_new_mem_op(ctx, type, (MIR_disp_t)(disp), base, 0, 1)))
+#define BRANCH(code, a, b) \
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, code, MIR_new_label_op(ctx, slow), a, b))
+
+  MIR_append_insn(ctx, fn, MIR_new_insn(ctx, MIR_AND, MIR_new_reg_op(ctx, t), MIR_new_reg_op(ctx, flags),
+      MIR_new_uint_op(ctx, ANT_OBJECT_FLAG_EXTENSIBLE | ANT_OBJECT_FLAG_SEALED | ANT_OBJECT_FLAG_FROZEN | ANT_OBJECT_FLAG_EXOTIC)));
+  BRANCH(MIR_BNE, MIR_new_reg_op(ctx, t), MIR_new_uint_op(ctx, ANT_OBJECT_FLAG_EXTENSIBLE));
+
+  LOAD(t, MIR_JSVAL, offsetof(ant_object_t, proto), ptr);
+  LOAD(ap, MIR_JSVAL, offsetof(ant_t, sym.array_proto), r_js);
+  BRANCH(MIR_BNE, MIR_new_reg_op(ctx, t), MIR_new_reg_op(ctx, ap));
+  
+  LOAD(t, MIR_T_U32, offsetof(ant_t, ic.epoch), r_js);
+  LOAD(ap, MIR_T_U32, offsetof(ant_t, array_chain_plain_epoch), r_js);
+  BRANCH(MIR_BNE, MIR_new_reg_op(ctx, t), MIR_new_reg_op(ctx, ap));
+  
+  LOAD(ap, MIR_JSVAL, offsetof(ant_t, sym.array_proto), r_js);
+  mir_emit_decode_ref(ctx, fn, ap, ap);
+  LOAD(t, MIR_T_U32, offsetof(ant_object_t, u.array.len), ap);
+  BRANCH(MIR_BNE, MIR_new_reg_op(ctx, t), MIR_new_int_op(ctx, 0));
+
+#undef LOAD
+#undef BRANCH
 }
 
 void mir_emit_word32_binary(

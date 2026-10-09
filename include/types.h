@@ -15,22 +15,29 @@ typedef struct ant_esm_state      ant_esm_state_t;
 typedef struct ant_regex_state    ant_regex_state_t;
 typedef struct ant_string_builder ant_string_builder_t;
 
+typedef struct iterator        iterator_t;
 typedef struct coroutine       coroutine_t;
 typedef struct headers_data    headers_data_t;
 typedef struct microtask_entry microtask_entry_t;
+typedef struct gc_card_table   gc_card_table_t;
 
 typedef struct ant_object ant_object_t;
 typedef struct ant_shape  ant_shape_t;
 
-typedef struct sv_vm      sv_vm_t;
-typedef struct sv_ast     sv_ast_t;
-typedef struct sv_func    sv_func_t;
-typedef struct sv_upvalue sv_upvalue_t;
-typedef struct sv_closure sv_closure_t;
-typedef struct sv_frame   sv_frame_t;
+typedef struct sv_vm        sv_vm_t;
+typedef struct sv_ast       sv_ast_t;
+typedef struct sv_func      sv_func_t;
+typedef struct sv_upvalue   sv_upvalue_t;
+typedef struct sv_closure   sv_closure_t;
+typedef struct sv_frame     sv_frame_t;
+typedef struct sv_code_unit sv_code_unit_t;
 
 typedef struct sv_eval_env_state    sv_eval_env_state_t;
 typedef struct sv_map_template_desc sv_map_template_desc_t;
+typedef struct sv_gf_mega_cache     sv_gf_mega_cache_t;
+
+typedef struct sv_gf_poly sv_gf_poly_t;
+typedef struct sv_pf_poly sv_pf_poly_t;
 
 typedef struct server_runtime_s    server_runtime_t;
 typedef struct server_request_s    server_request_t;

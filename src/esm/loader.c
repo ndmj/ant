@@ -11,7 +11,6 @@
 
 #include "modules/json.h"
 #include "modules/napi.h"
-#include "modules/symbol.h"
 #include "modules/uri.h"
 
 #include "silver/ast.h"
@@ -488,7 +487,7 @@ static ant_value_t esm_make_namespace_object(ant_t *js) {
   ant_value_t tag = js_mkstr(js, "Module", 6);
   GC_ROOT_PIN(js, tag);
   
-  ant_value_t tag_sym = get_toStringTag_sym();
+  ant_value_t tag_sym = js->sym.toStringTag_sym;
   mkprop_exact_attrs(js, ns, tag_sym, tag, 0);
 
   js_set_slot(ns, SLOT_BRAND, js_mknum(BRAND_MODULE_NAMESPACE));
@@ -1320,13 +1319,13 @@ static ant_value_t esm_eval_ambiguous_js_source(
   ant_value_t saved_exception = Ant_Exception_Peek(js);
 
   GC_ROOT_PIN(js, saved_exception);
-  code_arena_mark_t parse_mark = parse_arena_mark();
+  code_arena_mark_t parse_mark = parse_arena_mark(js);
 
-  sv_ast_t *program = sv_parse(js, js_code, (ant_offset_t)js_len, false);
+  sv_ast_t *program = sv_parse(js, js_code, (ant_offset_t)js_len, SV_PARSE_DETECT, false);
   GC_ROOT_RESTORE(js, exception_mark);
 
   if (!program) {
-    parse_arena_rewind(parse_mark);
+    parse_arena_rewind(js, parse_mark);
     Ant_Exception_Set(js, saved_exception);
     *format = MODULE_EVAL_FORMAT_CJS;
     if (js->modules.module_stack) js->modules.module_stack->format = *format;
@@ -1339,18 +1338,20 @@ static ant_value_t esm_eval_ambiguous_js_source(
     
     sv_func_t *func = js_compile_parsed_bytecode(
       js, program, js_code, 
-      js_len, SV_COMPILE_MODULE
-    ); parse_arena_rewind(parse_mark);
+      js_len, SV_COMPILE_MODULE, js_mkundef()
+    ); 
+    
+    parse_arena_rewind(js, parse_mark);
     
     if (!func) {
       if (Ant_Exception_Pending(js)) return Ant_Exception_Current(js);
       return js_mkerr_typed(js, JS_ERR_INTERNAL | JS_ERR_NO_STACK, "Unexpected compile error");
     }
 
-    return js_execute_compiled_bytecode(js, func, NULL);
+    return js_execute_compiled_module(js, func);
   }
 
-  parse_arena_rewind(parse_mark);
+  parse_arena_rewind(js, parse_mark);
   *format = MODULE_EVAL_FORMAT_CJS;
   if (js->modules.module_stack) js->modules.module_stack->format = *format;
   return esm_load_commonjs_module(js, resolved_path, js_code, js_len, ns, require_module);
@@ -1615,9 +1616,9 @@ static ant_value_t esm_load_value_module(ant_t *js, esm_module_t *mod, ant_value
   }
 }
 
-static void esm_module_record_cleanup(esm_module_record_t *record) {
+static void esm_module_record_cleanup(ant_t *js, esm_module_record_t *record) {
   if (!record || !record->has_mark) return;
-  parse_arena_rewind(record->mark);
+  parse_arena_rewind(js, record->mark);
   record->has_mark = false;
   record->program = NULL;
 }
@@ -1628,12 +1629,12 @@ static ant_value_t esm_eval_parsed_record(
 ) {
   sv_func_t *func = js_compile_parsed_bytecode(
     js, record->program, source,
-    source_len, SV_COMPILE_MODULE
+    source_len, SV_COMPILE_MODULE, js_mkundef()
   );
   
-  esm_module_record_cleanup(record);
+  esm_module_record_cleanup(js, record);
 
-  if (func) return js_execute_compiled_bytecode(js, func, NULL);
+  if (func) return js_execute_compiled_module(js, func);
   if (Ant_Exception_Pending(js)) return Ant_Exception_Current(js);
   
   return js_mkerr_typed(
@@ -1673,14 +1674,15 @@ static ant_value_t esm_parse_module_record(
     return js_mkundef();
   }
 
-  out->mark = parse_arena_mark();
+  out->mark = parse_arena_mark(js);
   out->has_mark = true;
 
   GC_ROOT_SAVE(exception_mark, js);
   ant_value_t saved_exception = Ant_Exception_Peek(js);
   GC_ROOT_PIN(js, saved_exception);
 
-  sv_ast_t *program = sv_parse(js, js_code, (ant_offset_t)js_len, false);
+  sv_parse_goal_t goal = *format == MODULE_EVAL_FORMAT_ESM ? SV_PARSE_MODULE : SV_PARSE_DETECT;
+  sv_ast_t *program = sv_parse(js, js_code, (ant_offset_t)js_len, goal, false);
   GC_ROOT_RESTORE(js, exception_mark);
 
   if (!program) {
@@ -1688,7 +1690,7 @@ static ant_value_t esm_parse_module_record(
       Ant_Exception_Set(js, saved_exception);
       *format = MODULE_EVAL_FORMAT_CJS;
       out->fallback_cjs = true;
-      esm_module_record_cleanup(out);
+      esm_module_record_cleanup(js, out);
       return js_mkundef();
     }
 
@@ -1699,7 +1701,7 @@ static ant_value_t esm_parse_module_record(
       resolved_path
     );
 
-    esm_module_record_cleanup(out);
+    esm_module_record_cleanup(js, out);
     return err;
   }
 
@@ -1708,7 +1710,7 @@ static ant_value_t esm_parse_module_record(
     else {
       *format = MODULE_EVAL_FORMAT_CJS;
       out->fallback_cjs = true;
-      esm_module_record_cleanup(out);
+      esm_module_record_cleanup(js, out);
       return js_mkundef();
     }
   }
@@ -1979,7 +1981,7 @@ static ant_value_t esm_load_module(ant_t *js, esm_module_t *mod, ant_value_t req
   );
   
   if (is_err(prep_res)) {
-    esm_module_record_cleanup(&record);
+    esm_module_record_cleanup(js, &record);
     free(content);
     mod->is_loading = false;
     return prep_res;
@@ -1988,12 +1990,12 @@ static ant_value_t esm_load_module(ant_t *js, esm_module_t *mod, ant_value_t req
   if (record.is_esm) {
     ant_value_t dep_res = esm_instantiate_static_dependencies(js, mod, record.program, ns);
     if (is_err(dep_res)) {
-      esm_module_record_cleanup(&record);
+      esm_module_record_cleanup(js, &record);
       free(content);
       mod->is_loading = false;
       return dep_res;
     }
-  } else esm_module_record_cleanup(&record);
+  } else esm_module_record_cleanup(js, &record);
 
   js_set_filename(js, mod->resolved_path);
   js_module_eval_ctx_push(js, &eval_ctx);

@@ -2,24 +2,18 @@
 #define ANT_ISOLATE_H
 
 #include "arena.h"
+#include "errors.h"
 #include "pool.h"
 #include "gc/objects.h"
+#include "silver/code_unit.h"
+#include "runtime.h"
 #include "primordials.h"
 #include "descriptors.h"
 
 #include "esm/loader.h"
 #include "modules/json.h"
-
-typedef struct {
-  const char *src;
-  const char *filename;
-  ant_offset_t src_len;
-  ant_offset_t off;
-  ant_offset_t span_len;
-  uint32_t line;
-  uint32_t col;
-  bool valid;
-} js_error_site_t;
+#include "modules/math.h"
+#include "modules/timer.h"
 
 typedef struct {
   ant_object_t *base;
@@ -49,6 +43,10 @@ static constexpr int MAX_PROTO_CHAIN_DEPTH = 256;
 static constexpr int MAX_MULTIREF_OBJS     = 128;
 static constexpr int MAX_DENSE_INITIAL_CAP = 8;
 
+// new Array(n) allocates dense storage for the whole length up to this
+// many elements, so filling it stays on the fast path
+static constexpr uint32_t MAX_DENSE_PREALLOC_LEN = 65536;
+
 struct ant_isolate_t {
   sv_vm_t *vm;
   void *jit_ctx;
@@ -67,18 +65,28 @@ struct ant_isolate_t {
   ant_fixed_arena_t obj_arena;
   ant_fixed_arena_t closure_arena;
   ant_fixed_arena_t upvalue_arena;
-
-  uint32_t next_ic_object_identity;
+  
   uint32_t prototype_write_epoch;
+  uint32_t array_chain_plain_epoch;
 
   bool promise_constructor_protector_invalid;
   bool promise_resolve_lookup_protector_invalid;
   bool promise_species_protector_invalid;
+  bool array_species_protector_invalid;
+  bool array_iteration_protector_invalid;
   bool promise_then_protector_invalid;
 
-  ant_shape_t ***ic_shape_ref_slots;
-  size_t ic_shape_ref_len;
-  size_t ic_shape_ref_cap;
+  struct {
+    uint32_t epoch;
+    uint32_t obj_epoch;
+    uint32_t next_object_identity;
+    ant_shape_t ***shape_ref_slots;
+    size_t shape_ref_len;
+    size_t shape_ref_cap;
+    sv_gf_mega_cache_t *gf_mega;
+    sv_gf_poly_t *gf_polys;
+    sv_pf_poly_t *pf_polys;
+  } ic;
 
   ant_value_t **c_roots;
   size_t c_root_count;
@@ -92,6 +100,7 @@ struct ant_isolate_t {
   ant_value_t this_val;
   ant_value_t current_func;
   ant_value_t length_str;
+  ant_value_t empty_str;
   ant_value_t ascii_chars[128];
 
   // TODO: struct
@@ -133,6 +142,7 @@ struct ant_isolate_t {
     const char *set;
     const char *arguments;
     const char *callee;
+    const char *next;
     const char *idx[10];
   } intern;
 
@@ -174,12 +184,21 @@ struct ant_isolate_t {
     ant_value_t bigint_proto;
     ant_value_t symbol_proto;
     ant_value_t array_values_fn;
+    ant_value_t array_push_fn;
+    ant_value_t array_ctor;
+    ant_value_t array_iterator_next;
+    ant_value_t string_ctor;
+    ant_value_t number_to_string_fn;
+    ant_value_t math_fns[ANT_MATH_INTRINSIC_COUNT];
     ant_value_t iterator_proto;
     ant_value_t array_iterator_proto;
     ant_value_t string_iterator_proto;
     ant_value_t generator_proto;
     ant_value_t async_generator_proto;
     ant_value_t async_iterator_proto;
+
+    #define ANT_SYMBOL(name, _desc) ant_value_t name##_sym;
+    #include "symbol_list.h"
   } sym;
 
   struct {
@@ -193,6 +212,12 @@ struct ant_isolate_t {
     #define ANT_MUTABLE_ROOT_ARR(name, n) ant_value_t name[n];
     #include "isolate_values.h"
   } mutable_roots;
+
+  struct {
+    struct ant_iterator_entry *entries;
+    size_t len;
+    size_t cap;
+  } iterators;
 
   ant_offset_t max_size;
   js_error_site_t errsite;
@@ -211,14 +236,64 @@ struct ant_isolate_t {
     size_t upvalues;
     size_t arrays;
   } alloc_bytes;
+  
+  gc_array_storage_cache_t array_storage;
+  
+  struct {
+    size_t last_live;
+    size_t pool_alloc;
+    size_t code_alloc;
+    size_t closure_alloc;
+    size_t closure_at_minor;
+    size_t closure_wm_at_major;
+    size_t closure_wm_minor_tried;
+    size_t pool_last_live;
+    uint64_t alloc_since_major;
+    size_t arrays_at_collect;
+    size_t alloc_limit;
+    size_t array_limit;
+    size_t array_major_limit;
+    size_t idle_retry_at;
 
-  size_t gc_last_live;
-  size_t gc_pool_alloc;
-  size_t gc_closure_alloc;
-  size_t gc_closure_at_minor;
-  size_t gc_closure_wm_at_major;
-  size_t gc_closure_wm_minor_tried;
-  size_t gc_pool_last_live;
+    size_t tick;
+    size_t nursery_threshold;
+    uint32_t major_every_n;
+    uint32_t major_live_growth_x256;
+    uint32_t major_pool_growth_x256;
+    uint32_t minor_surv_ewma;
+    uint32_t major_recl_ewma;
+    uint32_t major_time_share_ewma;
+    uint32_t major_work_share_ewma;
+    uint64_t last_major_end_ns;
+    uint64_t minor_cost_ns;
+    uint64_t major_cost_ns;
+  
+    uint64_t epoch;
+    uint8_t obj_epoch;
+    bool minor;
+    ant_object_t **mark_stack;
+    size_t mark_sp;
+    size_t mark_cap;
+  
+    gc_func_mark_profile_t func_profile;
+    sv_func_t **func_stack;
+    size_t func_sp;
+    size_t func_cap;
+    bool func_draining;
+  
+    sv_func_t **fb_funcs;
+    size_t fb_len;
+    size_t fb_cap;
+  
+    struct gc_string_block_mark *string_marks;
+    size_t string_mark_len, string_mark_cap;
+  
+    struct gc_large_string_mark *large_string_marks;
+    size_t large_string_mark_len, large_string_mark_cap;
+  
+    struct gc_bigint_block *bigint_blocks;
+    size_t bigint_block_len, bigint_block_cap;
+  } gc;
 
   ant_object_t *objects_old;
   ant_object_t *pending_promises;
@@ -234,6 +309,14 @@ struct ant_isolate_t {
   size_t permanent_root_len;
   size_t permanent_root_cap;
   size_t permanent_root_traced;
+
+  sv_code_units_t code_units;
+
+  struct {
+    ant_code_arena_t code;
+    ant_code_arena_t parse;
+    struct code_intern *interns;
+  } arenas;
 
   size_t remembered_upvalue_len;
   size_t remembered_upvalue_cap;
@@ -301,7 +384,9 @@ struct ant_isolate_t {
   bool wasm_interrupt_enabled;
 #endif
 
+  ant_timer_state_t timers;
   bool microtasks_draining;
+  
   struct coroutine *active_async_coro;
   struct gc_temp_root_scope *temp_roots;
 

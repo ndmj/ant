@@ -17,6 +17,7 @@
 #include "modules/bigint.h"
 #include "modules/collections.h"
 #include "modules/symbol.h"
+#include "modules/iterator.h"
 
 static bool can_be_held_weakly(ant_value_t value) {
   if (is_object_type(value) || vtype(value) == kTypeBuiltin) return true;
@@ -361,29 +362,6 @@ void weakmap_table_free(weakmap_table_t *table) {
   free(table);
 }
 
-ant_value_t collections_make_weakmap(ant_t *js) {
-  ant_value_t weakmap = js_mkobj(js);
-  if (is_err(weakmap)) return weakmap;
-
-  weakmap_table_t *table = calloc(1, sizeof(*table));
-  if (!table) return js_mkerr(js, "out of memory");
-
-  js_obj_ptr(weakmap)->type_tag = kTypeWeakMap;
-  ant_value_t prototype = js_get_ctor_proto(js, "WeakMap", 7);
-  if (is_special_object(prototype)) js_set_proto_init(weakmap, prototype);
-  js_set_native(weakmap, table, WEAKMAP_NATIVE_TAG);
-  gc_weak_register(js, js_obj_ptr(weakmap));
-  return weakmap;
-}
-
-ant_value_t collections_weakmap_get(ant_value_t weakmap, ant_value_t key) {
-  weakmap_table_t *table = get_weakmap_from_obj(weakmap, NULL);
-  if (!table || !can_be_held_weakly(key)) return js_mkundef();
-
-  weakmap_entry_t *entry = weakmap_table_find(table, key);
-  return entry ? entry->value : js_mkundef();
-}
-
 static inline bool weakmap_store_entry(
   ant_t *js,
   ant_object_t *object,
@@ -398,18 +376,6 @@ static inline bool weakmap_store_entry(
     gc_write_barrier(js, object, value);
   }
   return true;
-}
-
-bool collections_weakmap_set(
-  ant_t *js,
-  ant_value_t weakmap,
-  ant_value_t key,
-  ant_value_t value
-) {
-  ant_object_t *object = NULL;
-  weakmap_table_t *table = get_weakmap_from_obj(weakmap, &object);
-  if (!table || !can_be_held_weakly(key)) return false;
-  return weakmap_store_entry(js, object, table, key, value);
 }
 
 static weakset_entry_t **get_weakset_from_obj(ant_value_t obj) {
@@ -429,6 +395,12 @@ map_iterator_state_t *get_map_iter_state(ant_value_t obj) {
 }
 
 set_iterator_state_t *get_set_iter_state(ant_value_t obj) {
+  if (vtype(obj) == kTypeObject) {
+    ant_object_t *ptr = (ant_object_t *)vptr(obj);
+    if (ptr && ptr->native.tag == SET_ITER_NATIVE_TAG)
+      return (set_iterator_state_t *)ptr->native.ptr;
+  }
+
   return (set_iterator_state_t *)js_get_native(obj, SET_ITER_NATIVE_TAG);
 }
 
@@ -729,7 +701,7 @@ static ant_value_t map_forEach(ant_params_t) {
   return js_mkundef();
 }
 
-bool advance_map(ant_t *js, js_iter_t *it, ant_value_t *out) {
+bool advance_map(ant_t *js, iterator_t *it, ant_value_t *out) {
   map_iterator_state_t *state = get_map_iter_state(it->iterator);
   if (!state || !state->current) return false;
 
@@ -792,7 +764,7 @@ static ant_value_t map_entries(ant_params_t) {
   return create_map_iterator(js, js->this_val, ITER_TYPE_MAP_ENTRIES);
 }
 
-bool advance_set(ant_t *js, js_iter_t *it, ant_value_t *out) {
+bool advance_set(ant_t *js, iterator_t *it, ant_value_t *out) {
   set_iterator_state_t *state = get_set_iter_state(it->iterator);
   if (!state || !state->current) return false;
 
@@ -1028,7 +1000,7 @@ static ant_value_t set_record_has(ant_t *js, set_record_t *record, ant_value_t v
 }
 
 static ant_value_t set_record_close_keys_iterator(ant_t *js, ant_value_t iterator) {
-  js_iter_t it = { .iterator = iterator };
+  iterator_t it = { .iterator = iterator };
   js_iter_close(js, &it);
   return Ant_Exception_Pending(js) ? Ant_Exception_Current(js) : js_mkundef();
 }
@@ -1620,14 +1592,24 @@ static ant_value_t finreg_unregister(ant_params_t) {
   return js_bool(removed);
 }
 
+static ant_value_t map_group_add(ant_t *js, void *ctx, ant_value_t key, ant_value_t value) {
+  map_entry_t **map_head = ctx;
+  key = normalize_map_key(key);
+  
+  map_entry_t *entry = map_find_entry(js, map_head, key);
+  ant_value_t group;
+
+  if (entry) group = entry->value; else {
+    group = js_mkarr(js);
+    if (!map_store_entry(js, map_head, key, key, group)) return js_mkerr(js, "out of memory");
+  }
+  
+  js_arr_push(js, group, value);
+  return js_mkundef();
+}
+
 static ant_value_t map_groupBy(ant_params_t) {
   if (nargs < 2) return js_mkerr_typed(js, JS_ERR_TYPE, "Map.groupBy requires 2 arguments");
-  
-  ant_value_t items = args[0];
-  ant_value_t callback = args[1];
-  
-  if (vtype(callback) != kTypeFunction && vtype(callback) != kTypeBuiltin)
-    return js_mkerr_typed(js, JS_ERR_TYPE, "callback is not a function");
   
   ant_value_t map_obj = js_mkobj(js);
   js_obj_ptr(map_obj)->type_tag = kTypeMap;
@@ -1640,29 +1622,8 @@ static ant_value_t map_groupBy(ant_params_t) {
   *map_head = NULL;
   js_set_native(map_obj, map_head, MAP_NATIVE_TAG);
   
-  ant_offset_t len = js_arr_len(js, items);
-  for (ant_offset_t i = 0; i < len; i++) {
-    ant_value_t val = js_arr_get(js, items, i);
-    ant_value_t cb_args[2] = { val, tov((double)i) };
-    
-    ant_value_t key = normalize_map_key(
-      sv_vm_call(js->vm, js, callback, 
-      js_mkundef(), cb_args, 2, NULL, js_mkundef())
-    );
-    
-    if (is_err(key)) return key;
-    map_entry_t *entry = map_find_entry(js, map_head, key);
-    ant_value_t group;
-
-    if (entry) group = entry->value; else {
-      group = js_mkarr(js);
-      if (!map_store_entry(js, map_head, key, key, group)) return js_mkerr(js, "out of memory");
-    }
-    
-    js_arr_push(js, group, val);
-  }
-  
-  return map_obj;
+  ant_value_t grouped = js_group_by(js, args[0], args[1], map_group_add, map_head);
+  return is_err(grouped) ? grouped : map_obj;
 }
 
 static bool is_original_collection_adder(ant_value_t adder, ant_cfunc_t fn) {
@@ -1678,7 +1639,7 @@ static ant_value_t map_init_from_iterable(ant_t *js, ant_value_t map_obj, map_en
   bool use_fast_path 
     = is_original_collection_adder(adder, map_set);
 
-  js_iter_t it;
+  iterator_t it;
   if (!js_iter_open(js, iterable, &it))
     return Ant_Exception_Pending(js)
       ? Ant_Exception_Current(js)
@@ -1731,7 +1692,7 @@ static ant_value_t set_init_from_iterable(ant_t *js, ant_value_t set_obj, set_en
   
   bool use_fast_path  = is_original_collection_adder(adder, set_add);
 
-  js_iter_t it;
+  iterator_t it;
   if (!js_iter_open(js, iterable, &it))
     return Ant_Exception_Pending(js)
       ? Ant_Exception_Current(js)
@@ -1772,7 +1733,7 @@ static ant_value_t weakmap_init_from_iterable(
   
   bool use_fast_path = is_original_collection_adder(adder, weakmap_set);
 
-  js_iter_t it;
+  iterator_t it;
   if (!js_iter_open(js, iterable, &it))
     return Ant_Exception_Pending(js)
       ? Ant_Exception_Current(js)
@@ -1829,7 +1790,7 @@ static ant_value_t weakset_init_from_iterable(ant_t *js, ant_value_t ws_obj, wea
   
   bool use_fast_path = is_original_collection_adder(adder, weakset_add);
 
-  js_iter_t it;
+  iterator_t it;
   if (!js_iter_open(js, iterable, &it))
     return Ant_Exception_Pending(js)
       ? Ant_Exception_Current(js)
@@ -1996,20 +1957,20 @@ static ant_value_t builtin_WeakSet(ant_params_t) {
 
 void init_collections_module(ant_t *js) {
   ant_value_t object_proto = js->sym.object_proto;  
-  ant_value_t iter_sym = get_iterator_sym();
-  ant_value_t tag_sym = get_toStringTag_sym();
+  ant_value_t iter_sym = js->sym.iterator_sym;
+  ant_value_t tag_sym = js->sym.toStringTag_sym;
   
   js->builtins.map_iter_proto = js_mkobj(js);
   js_set_proto_init(js->builtins.map_iter_proto, js->sym.iterator_proto);
   js_set(js, js->builtins.map_iter_proto, "next", js_mkfun(map_iter_next));
   js_set_sym(js, js->builtins.map_iter_proto, tag_sym, js_mkstr(js, "Map Iterator", 12));
-  js_iter_register_advance(js->builtins.map_iter_proto, advance_map);
+  js_iter_register_advance(js, js->builtins.map_iter_proto, advance_map);
   
   js->builtins.set_iter_proto = js_mkobj(js);
   js_set_proto_init(js->builtins.set_iter_proto, js->sym.iterator_proto);
   js_set(js, js->builtins.set_iter_proto, "next", js_mkfun(set_iter_next));
   js_set_sym(js, js->builtins.set_iter_proto, tag_sym, js_mkstr(js, "Set Iterator", 12));
-  js_iter_register_advance(js->builtins.set_iter_proto, advance_set);
+  js_iter_register_advance(js, js->builtins.set_iter_proto, advance_set);
   
   ant_value_t map_proto = js_mkobj(js);
   js_set_proto_init(map_proto, object_proto);

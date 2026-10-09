@@ -29,7 +29,6 @@
 #include "modules/buffer.h"
 #include "modules/cjit.h"
 #include "modules/server.h"
-#include "modules/symbol.h"
 
 static struct {
   ant_t *js;
@@ -110,7 +109,7 @@ static ant_value_t js_raw_ctor_prop_feedback(ant_params_t) {
 }
 
 static ant_value_t js_raw_gc_mark_profile(ant_params_t) {
-  gc_func_mark_profile_t p = gc_func_mark_profile_get();
+  gc_func_mark_profile_t p = gc_func_mark_profile_get(js);
   ant_value_t out = js_newobj(js);
   
   js_set(js, out, "enabled", js_bool(p.enabled));
@@ -127,12 +126,12 @@ static ant_value_t js_raw_gc_mark_profile(ant_params_t) {
 static ant_value_t js_raw_gc_mark_profile_enable(ant_params_t) {
   bool enabled = true;
   if (nargs > 0) enabled = js_truthy(js, args[0]);
-  gc_func_mark_profile_enable(enabled);
+  gc_func_mark_profile_enable(js, enabled);
   return js_bool(enabled);
 }
 
 static ant_value_t js_raw_gc_mark_profile_reset(ant_params_t) {
-  gc_func_mark_profile_reset();
+  gc_func_mark_profile_reset(js);
   return js_mkundef();
 }
 
@@ -288,8 +287,8 @@ static ant_value_t js_stats_fn(ant_params_t) {
   js_set(js, result, "alloc", alloc);
 
   size_t buffer_mem = buffer_get_external_memory();
-  size_t code_mem = code_arena_get_memory();
-  size_t parse_mem = parse_arena_get_memory();
+  size_t code_mem = code_arena_get_memory(js);
+  size_t parse_mem = parse_arena_get_memory(js);
   size_t external_total = buffer_mem + code_mem + parse_mem;
   
   ant_value_t ext = js_newobj(js);
@@ -400,7 +399,7 @@ static ant_value_t js_match(ant_params_t) {
   js_prop_iter_end(&iter);
   if (vtype(guard_arm) != kTypeUndefined) return match_resolve_arm(js, guard_arm, value);
   
-  ant_value_t fallback = js_get_sym(js, arms, get_default_sym());
+  ant_value_t fallback = js_get_sym(js, arms, js->sym.default_sym);
   if (vtype(fallback) != kTypeUndefined) return match_resolve_arm(js, fallback, value);
 
   return js_mkundef();
@@ -459,6 +458,7 @@ static ant_value_t js_highlight_tags(ant_params_t) {
 
 void init_builtin_module(ant_t *js) {
   ant_value_t ant_obj = js->Ant;
+  js_set_sym(js, ant_obj, js->sym.toStringTag_sym, ANT_STRING("Ant"));
 
   js_set_exact(js, ant_obj, "version", ANT_STRING(ANT_VERSION));
   js_set_exact(js, ant_obj, "channel", ANT_CANARY ? ANT_STRING("canary") : ANT_STRING("stable"));

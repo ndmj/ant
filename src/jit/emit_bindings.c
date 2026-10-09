@@ -6,8 +6,14 @@ static MIR_reg_t jit_upvalue_cell(jit_compile_t *c, uint16_t index, int site) {
   char table_name[32], cell_name[32];
   snprintf(table_name, sizeof(table_name), "upvs%d", site);
   snprintf(cell_name, sizeof(cell_name), "upv%d", site);
-  MIR_reg_t table = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, table_name);
   MIR_reg_t cell = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, cell_name);
+  if (c->func->upvalue_count <= SV_CLOSURE_INLINE_UPVALS) {
+    MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_MOV,
+        MIR_new_reg_op(c->ctx, cell), MIR_new_mem_op(c->ctx, MIR_T_P,
+            (MIR_disp_t)(offsetof(sv_closure_t, inline_upvals) + index * sizeof(sv_upvalue_t *)), c->r_closure, 0, 1)));
+    return cell;
+  }
+  MIR_reg_t table = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, table_name);
   MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_MOV,
       MIR_new_reg_op(c->ctx, table), MIR_new_mem_op(c->ctx, MIR_T_P,
           offsetof(sv_closure_t, upvalues), c->r_closure, 0, 1)));
@@ -80,6 +86,7 @@ void jit_emit_bindings(jit_compile_t *c) {
                                    MIR_new_reg_op(c->ctx, src)));
       mir_emit_upval_write_barrier(c->ctx, c->jit_func,
                                    c->upval_barrier_proto, c->imp_upval_barrier,
+                                   c->imp_upval_flagged,
                                    c->r_js, r_uv, src, un);
       break;
     }
@@ -106,6 +113,7 @@ void jit_emit_bindings(jit_compile_t *c) {
                                    MIR_new_reg_op(c->ctx, src)));
       mir_emit_upval_write_barrier(c->ctx, c->jit_func,
                                    c->upval_barrier_proto, c->imp_upval_barrier,
+                                   c->imp_upval_flagged,
                                    c->r_js, r_uv, src, un);
       break;
     }
@@ -153,7 +161,7 @@ void jit_emit_bindings(jit_compile_t *c) {
       MIR_label_t gg_done = MIR_new_label(c->ctx);
       bool gg_fast = c->r_ic_epoch_val != 0 &&
                      mir_emit_get_global_ic_fastpath(
-                         c->ctx, c->jit_func, c->func, c->bc_off,
+                         c->ctx, c->jit_func, c->js, c->func, c->bc_off,
                          c->r_js, dst, gg_slow, c->r_ic_epoch_val, c->ip);
       if (gg_fast) {
         MIR_append_insn(c->ctx, c->jit_func,
@@ -171,6 +179,10 @@ void jit_emit_bindings(jit_compile_t *c) {
                                         MIR_new_int_op(c->ctx, (int64_t)c->bc_off)));
       jit_emit_throw_if_error(c, dst);
       if (gg_fast) MIR_append_insn(c->ctx, c->jit_func, gg_done);
+      if (c->vs.known_builtin && atom->len == 6 && memcmp(atom->str, "String", 6) == 0)
+        c->vs.known_builtin[c->vs.sp - 1] = JIT_BUILTIN_STRING;
+      else if (c->vs.known_builtin && atom->len == 4 && memcmp(atom->str, "Math", 4) == 0)
+        c->vs.known_builtin[c->vs.sp - 1] = JIT_BUILTIN_MATH;
       if (known_self_global) {
         c->vs.known_func[c->vs.sp - 1] = c->func;
         mir_emit_self_binding_guard_value_kept(

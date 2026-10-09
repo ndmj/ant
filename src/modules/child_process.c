@@ -7,7 +7,6 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
-#include <math.h>
 #include <utarray.h>
 
 #ifdef _WIN32
@@ -37,14 +36,11 @@
 #include "gc/roots.h"
 #include "silver/call.h"
 
-#include "process_plan.h"
 #include "process_stage.h"
-
 #include "modules/buffer.h"
 #include "modules/events.h"
 #include "modules/process.h"
 #include "modules/stream.h"
-#include "modules/symbol.h"
 #include "modules/child_process.h"
 
 typedef struct 
@@ -126,6 +122,7 @@ struct child_process_s {
   struct child_process_s *prev;
 };
 
+// TODO: isolate
 static child_process_t *pending_children_head = NULL;
 static child_process_t *pending_children_tail = NULL;
 
@@ -976,7 +973,7 @@ static ant_value_t create_child_object(ant_t *js, child_process_t *cp) {
   js_set(js, obj, "write", js_mkfun(child_write));
   js_set(js, obj, "end", js_mkfun(child_end));
   
-  js_set_sym(js, obj, get_toStringTag_sym(), js_mkstr(js, "ChildProcess", 12));
+  js_set_sym(js, obj, js->sym.toStringTag_sym, js_mkstr(js, "ChildProcess", 12));
   
   return obj;
 }
@@ -1653,10 +1650,17 @@ static ant_value_t exec_callback_promisified_call(ant_params_t) {
   for (int i = 0; i < nargs; i++) call_args[i] = args[i];
   call_args[nargs] = callback;
 
+  GC_ROOT_SAVE(root_mark, js);
+  GC_ROOT_PIN(js, callback);
+  GC_ROOT_PIN(js, state);
+  
   ant_value_t call_result = sv_vm_call(
     js->vm, js, original, js_getthis(js), 
     call_args, nargs + 1, NULL, js_mkundef()
-  ); free(call_args);
+  );
+  
+  free(call_args);
+  GC_ROOT_RESTORE(js, root_mark);
 
   ant_value_t settled = js_get_slot(state, SLOT_SETTLED);
   bool is_settled = (vtype(settled) == kTypeBool && settled == js_true);
@@ -1718,235 +1722,6 @@ static ant_value_t builtin_execFile(ant_params_t) {
   eventemitter_add_listener(js, child, "close", close_listener, true);
 
   return child;
-}
-
-static bool child_process_plan_copy_string(
-  ant_t *js, ant_value_t value, const char *description, char **out
-) {
-  if (vtype(value) != kTypeString) {
-    js_mkerr_typed(js, JS_ERR_TYPE, "%s must be a string", description);
-    return false;
-  }
-  size_t len = 0;
-  char *text = js_getstr(js, value, &len);
-  if (!text || memchr(text, '\0', len)) {
-    js_mkerr_typed(js, JS_ERR_TYPE, "%s cannot contain NUL bytes", description);
-    return false;
-  }
-  char *copy = malloc(len + 1);
-  if (!copy) {
-    js_mkerr(js, "Out of memory");
-    return false;
-  }
-  if (len) memcpy(copy, text, len);
-  copy[len] = '\0';
-  *out = copy;
-  return true;
-}
-
-static bool child_process_plan_number_to_int(
-  ant_value_t value, int *out
-) {
-  if (vtype(value) != kTypeNumber) return false;
-  double number = js_getnum(value);
-  if (!isfinite(number) || trunc(number) != number ||
-      number < (double)INT_MIN || number > (double)INT_MAX)
-    return false;
-  *out = (int)number;
-  return true;
-}
-
-static bool child_process_plan_apply_options(
-  ant_t *js, ant_process_plan_t *plan, ant_value_t options
-) {
-  if (!is_special_object(options)) return true;
-  ant_value_t cwd = js_get(js, options, "cwd");
-  if (!is_undefined(cwd) && !child_process_plan_copy_string(
-    js, cwd, "Child process cwd", &plan->cwd
-  )) return false;
-  ant_value_t redirects = js_get(js, options, "redirections");
-  if (is_undefined(redirects)) return true;
-  if (vtype(redirects) != kTypeArray) {
-    js_mkerr_typed(js, JS_ERR_TYPE, "Child process redirections must be an array");
-    return false;
-  }
-  for (ant_offset_t i = 0; i < js_arr_len(js, redirects); i++) {
-    ant_value_t redirect = js_arr_get(js, redirects, i);
-    ant_value_t kind_value = is_special_object(redirect)
-      ? js_get(js, redirect, "kind") : js_mkundef();
-    if (vtype(kind_value) != kTypeNumber) {
-      js_mkerr_typed(js, JS_ERR_TYPE, "Invalid child process redirection");
-      return false;
-    }
-    int kind;
-    if (!child_process_plan_number_to_int(kind_value, &kind) ||
-        kind < ANT_PROCESS_REDIRECT_STDIN ||
-        kind > ANT_PROCESS_REDIRECT_STDERR_TO_STDOUT) {
-      js_mkerr_typed(js, JS_ERR_TYPE, "Invalid child process redirection kind");
-      return false;
-    }
-    char *path = NULL;
-    if (kind != ANT_PROCESS_REDIRECT_STDERR_TO_STDOUT &&
-        !child_process_plan_copy_string(
-          js, js_get(js, redirect, "path"),
-          "Child process redirection path", &path
-        )) return false;
-    bool added = ant_process_plan_add_redirect(
-      plan, (ant_process_redirect_kind_t)kind, path
-    );
-    free(path);
-    if (!added) {
-      js_mkerr(js, "Out of memory");
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool child_process_plan_add_values(
-  ant_t *js, ant_process_plan_t *plan, ant_value_t values
-) {
-  if (vtype(values) != kTypeArray || js_arr_len(js, values) == 0) {
-    js_mkerr_typed(js, JS_ERR_TYPE, "Process command must be a non-empty array");
-    return false;
-  }
-  size_t count = (size_t)js_arr_len(js, values);
-  const char **argv = calloc(count, sizeof(*argv));
-  if (!argv) {
-    js_mkerr(js, "Out of memory");
-    return false;
-  }
-  bool valid = true;
-  for (size_t i = 0; i < count; i++) {
-    ant_value_t value = js_arr_get(js, values, (ant_offset_t)i);
-    size_t len = 0;
-    if (vtype(value) != kTypeString) {
-      js_mkerr_typed(js, JS_ERR_TYPE, "Child process arguments must be strings");
-      valid = false;
-      break;
-    }
-    argv[i] = js_getstr(js, value, &len);
-    if (!argv[i] || memchr(argv[i], '\0', len)) {
-      js_mkerr_typed(js, JS_ERR_TYPE, "Child process arguments cannot contain NUL bytes");
-      valid = false;
-      break;
-    }
-  }
-  if (valid && argv[0][0] == '\0') {
-    js_mkerr_typed(js, JS_ERR_TYPE, "Process executable cannot be empty");
-    valid = false;
-  }
-  if (valid && !ant_process_plan_add_command(plan, argv, count)) {
-    js_mkerr(js, "Out of memory");
-    valid = false;
-  }
-  free(argv);
-  return valid;
-}
-
-static bool child_process_plan_add_native_result(
-  ant_t *js, ant_process_plan_t *plan, ant_value_t result
-) {
-  ant_value_t stdout_value = js_get(js, result, "stdout");
-  ant_value_t stderr_value = js_get(js, result, "stderr");
-  ant_value_t exit_code_value = js_get(js, result, "exitCode");
-
-  int exit_code;
-  if (!child_process_plan_number_to_int(exit_code_value, &exit_code)) {
-    js_mkerr_typed(js, JS_ERR_TYPE, "Invalid native pipeline stage");
-    return false;
-  }
-  
-  size_t stdout_len = 0;
-  size_t stderr_len = 0;
-  
-  const uint8_t *stdout_data = NULL;
-  const uint8_t *stderr_data = NULL;
-  
-  bool stdout_valid = buffer_source_get_bytes(
-    js, stdout_value, 
-    &stdout_data, &stdout_len
-  );
-  
-  bool stderr_valid = buffer_source_get_bytes(
-    js, stderr_value, 
-    &stderr_data, &stderr_len
-  );
-  
-  if (!stdout_valid || !stderr_valid) {
-    js_mkerr_typed(js, JS_ERR_TYPE, "Invalid native pipeline stage payload");
-    return false;
-  }
-
-  if (!ant_process_plan_add_native_stage(
-    plan, (const char *)stdout_data, stdout_len,
-    (const char *)stderr_data, stderr_len,
-    exit_code
-  )) {
-    js_mkerr(js, "Out of memory");
-    return false;
-  }
-  
-  return true;
-}
-
-ant_value_t child_process_exec_file_result(
-  ant_t *js,
-  ant_value_t file,
-  ant_value_t argv,
-  ant_value_t options
-) {
-  ant_process_plan_t plan;
-  ant_process_plan_init(&plan);
-  plan.result_mode = ANT_PROCESS_RESULT_BYTES;
-  
-  ant_value_t values = js_mkarr(js);
-  js_arr_push(js, values, file);
-  
-  if (vtype(argv) == kTypeArray) for (ant_offset_t i = 0; i < js_arr_len(js, argv); i++)
-    js_arr_push(js, values, js_arr_get(js, argv, i));
-  if (!child_process_plan_apply_options(js, &plan, options) ||
-      !child_process_plan_add_values(js, &plan, values)) {
-    ant_process_plan_dispose(&plan);
-    return ant_process_plan_rejected_result(js, Ant_Exception_Pending(js)
-      ? Ant_Exception_Value(js, Ant_Exception_Peek(js))
-      : js_mkerr(js, "Invalid process plan"));
-  }
-  
-  return ant_process_plan_submit(js, &plan);
-}
-
-ant_value_t child_process_pipeline_result(
-  ant_t *js,
-  ant_value_t commands,
-  ant_value_t options
-) {
-  if (vtype(commands) != kTypeArray || js_arr_len(js, commands) == 0) {
-    return ant_process_plan_rejected_result(js,
-      js_mkerr(js, "pipeline requires at least one command"));
-  }
-  ant_process_plan_t plan;
-  ant_process_plan_init(&plan);
-  plan.result_mode = ANT_PROCESS_RESULT_BYTES;
-  if (!child_process_plan_apply_options(js, &plan, options)) goto invalid;
-  for (ant_offset_t i = 0; i < js_arr_len(js, commands); i++) {
-    ant_value_t command = js_arr_get(js, commands, i);
-    if (vtype(command) == kTypeArray) {
-      if (!child_process_plan_add_values(js, &plan, command)) goto invalid;
-    } else if (is_special_object(command)) {
-      if (!child_process_plan_add_native_result(js, &plan, command)) goto invalid;
-    } else {
-      js_mkerr_typed(js, JS_ERR_TYPE, "Invalid pipeline stage");
-      goto invalid;
-    }
-  }
-  return ant_process_plan_submit(js, &plan);
-
-invalid:
-  ant_process_plan_dispose(&plan);
-  return ant_process_plan_rejected_result(js, Ant_Exception_Pending(js)
-    ? Ant_Exception_Value(js, Ant_Exception_Peek(js))
-    : js_mkerr(js, "Invalid process plan"));
 }
 
 static bool sync_encoding_wants_string(ant_t *js, ant_value_t options_arg) {
@@ -2904,7 +2679,7 @@ ant_value_t child_process_library(ant_t *js) {
   js_set(js, lib, "execFileSync", js_mkfun(builtin_execFileSync));
   js_set(js, lib, "spawnSync", js_mkfun(builtin_spawnSync));
   js_set(js, lib, "fork", js_mkfun(builtin_fork));
-  js_set_sym(js, lib, get_toStringTag_sym(), js_mkstr(js, "child_process", 13));
+  js_set_sym(js, lib, js->sym.toStringTag_sym, js_mkstr(js, "child_process", 13));
   
   return lib;
 }

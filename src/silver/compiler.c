@@ -6,6 +6,7 @@
 #include "silver/engine.h"
 #include "silver/compiler.h"
 #include "silver/directives.h"
+#include "silver/eval_env.h"
 
 #include "internal.h"
 #include "debug.h"
@@ -35,10 +36,11 @@ enum {
   SV_ITER_HINT_STRING = 4,
 };
 
-static const char *pin_source_text(const char *source, ant_offset_t source_len) {
+static const char *copy_source_text(ant_t *js, const char *source, ant_offset_t source_len) {
   if (!source || source_len <= 0) return source;
-  const char *pinned = code_arena_alloc(source, (size_t)source_len);
-  return pinned ? pinned : source;
+  const char *copy = sv_code_text(js, source, (size_t)source_len);
+  if (!copy) js_mkerr(js, "out of memory copying source text");
+  return copy;
 }
 
 static void emit(sv_compiler_t *c, uint8_t byte) {
@@ -164,8 +166,8 @@ static int add_constant(sv_compiler_t *c, ant_value_t val) {
   return c->const_count++;
 }
 
-static void build_gc_const_tables(sv_func_t *func) {
-  if (!func || func->const_count <= 0 || !func->constants) return;
+static bool build_gc_const_tables(ant_t *js, sv_func_t *func) {
+  if (!func || func->const_count <= 0 || !func->constants) return true;
 
   int child_count = 0;
   for (int i = 0; i < func->const_count; i++) {
@@ -173,23 +175,22 @@ static void build_gc_const_tables(sv_func_t *func) {
   }
 
   if (child_count > 0) {
-    func->child_funcs = code_arena_bump((size_t)child_count * sizeof(sv_func_t *));
-    if (func->child_funcs) {
-      int out = 0;
-      
-      for (int i = 0; i < func->const_count; i++) {
-        if (vtype(func->constants[i]) != kTypeFunctionInfo) continue;
-        sv_func_t *child = (sv_func_t *)vptr(func->constants[i]);
-        child->parent = func;
-        func->child_funcs[out++] = child;
-      } 
-      
-      func->child_func_count = child_count;
+    func->child_funcs = sv_code_bump(js, (size_t)child_count * sizeof(sv_func_t *));
+    if (!func->child_funcs) return false;
+    
+    int out = 0;
+    for (int i = 0; i < func->const_count; i++) {
+      if (vtype(func->constants[i]) != kTypeFunctionInfo) continue;
+      sv_func_t *child = (sv_func_t *)vptr(func->constants[i]);
+      child->parent = func;
+      func->child_funcs[out++] = child;
     }
+    
+    func->child_func_count = child_count;
   }
 
   uint8_t *marked_slots = calloc((size_t)func->const_count, sizeof(uint8_t));
-  if (!marked_slots) return;
+  if (!marked_slots) return false;
   int slot_count = 0;
 
   for (int pc = 0; pc < func->code_len;) {
@@ -208,19 +209,44 @@ static void build_gc_const_tables(sv_func_t *func) {
     pc += size;
   }
 
-  if (slot_count > 0) {
-    func->gc_const_slots = code_arena_bump((size_t)slot_count * sizeof(uint32_t));
-    if (func->gc_const_slots) {
-      int out = 0;
-      for (int i = 0; i < func->const_count; i++) {
-        if (!marked_slots[i]) continue;
-        func->gc_const_slots[out++] = (uint32_t)i;
-      }
-      func->gc_const_slot_count = slot_count;
+  if (func->unit) for (int i = 0; i < func->const_count; i++) {
+    uint8_t type = vtype(func->constants[i]);
+    if ((type == kTypeString || type == kTypeBigInt) && !marked_slots[i]) {
+      marked_slots[i] = 1;
+      slot_count++;
     }
   }
 
+  if (slot_count > 0) {
+    func->gc_const_slots = sv_code_bump(js, (size_t)slot_count * sizeof(uint32_t));
+    if (!func->gc_const_slots) {
+      free(marked_slots);
+      return false;
+    }
+    
+    int out = 0;
+    for (int i = 0; i < func->const_count; i++) {
+      if (!marked_slots[i]) continue;
+      func->gc_const_slots[out++] = (uint32_t)i;
+    }
+    
+    func->gc_const_slot_count = slot_count;
+  }
+
   free(marked_slots);
+  return true;
+}
+
+static sv_ic_entry_t *alloc_ic_slots(ant_t *js, uint16_t count) {
+  if (count == 0) return NULL;
+  sv_ic_entry_t *slots = sv_code_bump(js, (size_t)count * sizeof(*slots));
+  if (!slots) return NULL;
+  
+  memset(slots, 0, (size_t)count * sizeof(*slots));
+  if (js->code_units.active) for (uint16_t i = 0; i < count; i++)
+    slots[i].shape_ref_mask = SV_IC_UNIT_OWNED;
+  
+  return slots;
 }
 
 static void emit_constant(sv_compiler_t *c, ant_value_t val) {
@@ -264,9 +290,50 @@ static bool template_has_valid_cooked_segments(const sv_ast_t *node) {
   return true;
 }
 
+static const char *copy_name(ant_t *js, const char *name, uint32_t len) {
+  if (!name || len == 0) return name;
+  char *copy = sv_code_bump(js, len);
+  
+  if (!copy) {
+    js_mkerr(js, "out of memory copying a binding name");
+    return NULL;
+  }
+  
+  memcpy(copy, name, len);
+  return copy;
+}
+
+static sv_func_t *sv_func_new(ant_t *js) {
+  sv_func_t *func = sv_code_bump(js, sizeof(*func));
+  ANT_ASSERT(func != NULL, "failed to allocate a function");
+  
+  memset(func, 0, sizeof(*func));
+  sv_code_unit_add_func(js, func);
+  
+  func->debug = sv_code_bump(js, sizeof(*func->debug));
+  ANT_ASSERT(func->debug != NULL, "failed to allocate function debug info");
+  memset(func->debug, 0, sizeof(*func->debug));
+  
+  return func;
+}
+
+static ant_value_t sv_const_str(sv_compiler_t *c, const char *ptr, size_t len) {
+  if (!c->js->code_units.active) return js_mkstr_permanent(c->js, ptr, len);
+  ant_value_t str = js_mkstr(c->js, ptr, len);
+  if (!is_err(str) && !sv_code_unit_root(c->js, str)) return js_mkerr(c->js, "oom");
+  return str;
+}
+
+static ant_value_t sv_const_bigint(sv_compiler_t *c, const char *digits, size_t len, bool negative) {
+  if (!c->js->code_units.active) return js_mkbigint_permanent(c->js, digits, len, negative);
+  ant_value_t big = js_mkbigint(c->js, digits, len, negative);
+  if (!is_err(big) && !sv_code_unit_root(c->js, big)) return js_mkerr(c->js, "oom");
+  return big;
+}
+
 static inline ant_value_t ast_string_const(sv_compiler_t *c, const sv_ast_t *node) {
-  if (!node || !node->str) return js_mkstr_permanent(c->js, "", 0);
-  return js_mkstr_permanent(c->js, node->str, node->len);
+  if (!node || !node->str) return sv_const_str(c, "", 0);
+  return sv_const_str(c, node->str, node->len);
 }
 
 static inline void compile_static_property_key(sv_compiler_t *c, sv_ast_t *key) {
@@ -283,13 +350,13 @@ static inline void compile_static_property_key(sv_compiler_t *c, sv_ast_t *key) 
   if (key->type == N_NUMBER) {
     char buf[SV_LITERAL_NUM_KEY_BUF_SIZE];
     size_t n = literal_num_key(key->num, buf, sizeof(buf));
-    emit_constant(c, js_mkstr_permanent(c->js, buf, n));
+    emit_constant(c, sv_const_str(c, buf, n));
     return;
   }
 
   if (key->type == N_IDENT) {
-    if (is_quoted_ident_key(key)) emit_constant(c, js_mkstr_permanent(c->js, key->str + 1, key->len - 2));
-    else emit_constant(c, js_mkstr_permanent(c->js, key->str, key->len));
+    if (is_quoted_ident_key(key)) emit_constant(c, sv_const_str(c, key->str + 1, key->len - 2));
+    else emit_constant(c, sv_const_str(c, key->str, key->len));
     return;
   }
 
@@ -435,7 +502,7 @@ static int add_atom(sv_compiler_t *c, const char *str, uint32_t len) {
   const char *interned = intern_string(str, (size_t)len);
   const char *stored = interned;
   if (!stored) {
-    char *copy = code_arena_bump(len);
+    char *copy = code_arena_bump(c->js, len);
     memcpy(copy, str, len);
     stored = copy;
   }
@@ -499,7 +566,7 @@ static void sv_func_init_code_and_map_templates(
     "function bytecode sidecar size overflow"
   );
 
-  uint8_t *storage = code_arena_bump(prefix_size + (size_t)c->code_len);
+  uint8_t *storage = sv_code_bump(c->js, prefix_size + (size_t)c->code_len);
   ANT_ASSERT(storage != NULL, "failed to allocate function bytecode");
   
   if (c->map_template_count > 0) {
@@ -544,7 +611,7 @@ static void sv_func_init_obj_sites(const sv_compiler_t *c, sv_func_t *func) {
   }
   if (count == 0) return;
 
-  func->obj_sites = code_arena_bump((size_t)count * sizeof(sv_obj_site_cache_t));
+  func->obj_sites = sv_code_bump(c->js, (size_t)count * sizeof(sv_obj_site_cache_t));
   memset(func->obj_sites, 0, (size_t)count * sizeof(sv_obj_site_cache_t));
   func->obj_site_count = count;
 
@@ -567,7 +634,7 @@ static void sv_func_init_obj_sites(const sv_compiler_t *c, sv_func_t *func) {
       if (i >= count) break;
       if (func->obj_sites[i].bc_off != c->shaped_sites[s].bc_off) continue;
       
-      uint32_t *ka = code_arena_bump((size_t)kc * sizeof(uint32_t));
+      uint32_t *ka = sv_code_bump(c->js, (size_t)kc * sizeof(uint32_t));
       if (!ka) continue;
       
       memcpy(ka, c->shaped_keys + c->shaped_sites[s].first_key, (size_t)kc * sizeof(uint32_t));
@@ -630,7 +697,7 @@ static void emit_const_assign_error(sv_compiler_t *c, const char *name, uint32_t
   static const char suffix[] = "'";
   
   uint32_t mlen = (uint32_t)(sizeof(prefix) - 1 + len + sizeof(suffix) - 1);
-  char *buf = code_arena_bump(mlen);
+  char *buf = sv_code_bump(c->js, mlen);
   
   memcpy(buf, prefix, sizeof(prefix) - 1);
   memcpy(buf + sizeof(prefix) - 1, name, len);
@@ -1030,6 +1097,29 @@ static int resolve_upvalue(sv_compiler_t *c, const char *name, uint32_t len) {
   return resolve_upvalue_raw(c, name, len);
 }
 
+static sv_compiler_t *global_name_shadowed(sv_compiler_t *c, const char *name, uint32_t len) {
+  if (has_active_with_scope(c)) return NULL;
+  sv_compiler_t *root = c;
+  for (sv_compiler_t *cur = c; cur; root = cur, cur = cur->enclosing)
+    if (resolve_local(cur, name, len) >= 0) return NULL;
+  return root;
+}
+
+static bool await_allowed(const sv_compiler_t *c) {
+  if (c->is_async) return true;
+  return c->enclosing && !c->enclosing->enclosing && !c->enclosing->function_ctor_root;
+}
+
+static bool undefined_shadowed(sv_compiler_t *c) {
+  sv_compiler_t *root = global_name_shadowed(c, "undefined", 9);
+  return !root || root->eval_shadows_undefined;
+}
+
+static bool global_this_shadowed(sv_compiler_t *c) {
+  sv_compiler_t *root = global_name_shadowed(c, "globalThis", 10);
+  return !root || root->eval_shadows_global_this;
+}
+
 typedef struct {
   uint32_t *slots;
   uint32_t capacity;
@@ -1261,14 +1351,14 @@ static void sv_func_finalize_type_data(
   if (comp->eval_scope_count > 0 || comp->eval_var_count > 0 || comp->global_lexical_count > 0) {
     size_t metadata_size = offsetof(sv_func_metadata_t, local_types) +
       (size_t)local_type_count * sizeof(sv_type_info_t);
-    sv_func_metadata_t *metadata = code_arena_bump(metadata_size);
+    sv_func_metadata_t *metadata = sv_code_bump(comp->js, metadata_size);
     ANT_ASSERT(metadata != NULL, "failed to allocate function metadata");
     ANT_ASSERT(
       ((uintptr_t)metadata % _Alignof(sv_func_metadata_t)) == 0,
       "code arena returned misaligned function metadata"
     );
     memset(metadata, 0, metadata_size);
-    sv_eval_scope_t *eval_scopes = code_arena_bump(
+    sv_eval_scope_t *eval_scopes = sv_code_bump(comp->js, 
       (size_t)comp->eval_scope_count * sizeof(sv_eval_scope_t));
     ANT_ASSERT(eval_scopes != NULL, "failed to allocate eval scopes");
     metadata->eval_scopes = eval_scopes;
@@ -1276,13 +1366,13 @@ static void sv_func_finalize_type_data(
     metadata->eval_var_count = comp->eval_var_count;
     if (comp->eval_var_count) {
       size_t size = (size_t)comp->eval_var_count * sizeof(sv_eval_decl_t);
-      metadata->eval_vars = code_arena_bump(size);
+      metadata->eval_vars = sv_code_bump(comp->js, size);
       memcpy(metadata->eval_vars, comp->eval_vars, size);
     }
     metadata->global_lexical_count = comp->global_lexical_count;
     if (comp->global_lexical_count) {
       size_t size = (size_t)comp->global_lexical_count * sizeof(sv_eval_decl_t);
-      metadata->global_lexicals = code_arena_bump(size);
+      metadata->global_lexicals = sv_code_bump(comp->js, size);
       memcpy(metadata->global_lexicals, comp->global_lexicals, size);
     }
 
@@ -1291,7 +1381,7 @@ static void sv_func_finalize_type_data(
       binding_count += comp->eval_scopes[i].count;
 
     sv_runtime_binding_t *bindings = binding_count > 0
-      ? code_arena_bump(binding_count * sizeof(sv_runtime_binding_t))
+      ? sv_code_bump(comp->js, binding_count * sizeof(sv_runtime_binding_t))
       : NULL;
     ANT_ASSERT(
       binding_count == 0 || bindings != NULL,
@@ -1308,6 +1398,12 @@ static void sv_func_finalize_type_data(
       if (src->count > 0) {
         memcpy(bindings + binding_offset, src->bindings,
           (size_t)src->count * sizeof(sv_runtime_binding_t));
+        for (uint32_t b = 0; b < src->count; b++) {
+          sv_runtime_binding_t *binding = &bindings[binding_offset + b];
+          const char *name = copy_name(comp->js, binding->name, binding->len);
+          ANT_ASSERT(name != NULL || binding->len == 0, "failed to copy eval binding name");
+          binding->name = name;
+        }
         binding_offset += src->count;
       }
     }
@@ -1324,7 +1420,7 @@ static void sv_func_finalize_type_data(
   }
 
   if (local_type_count == 0) return;
-  sv_type_info_t *local_types = code_arena_bump(
+  sv_type_info_t *local_types = sv_code_bump(comp->js, 
     (size_t)local_type_count * sizeof(sv_type_info_t));
   ANT_ASSERT(local_types != NULL, "failed to allocate function local types");
   memset(local_types, 0, (size_t)local_type_count * sizeof(sv_type_info_t));
@@ -1497,7 +1593,7 @@ static void emit_lexical_new_target(sv_compiler_t *c) {
 
 static inline void emit_get_module_import_binding(sv_compiler_t *c) {
   emit_op(c, OP_SPECIAL_OBJ);
-  emit(c, 3);
+  emit(c, SV_SPECIAL_MODULE_IMPORT);
 }
 
 static void emit_get_var(sv_compiler_t *c, const char *name, uint32_t len) {
@@ -1581,7 +1677,7 @@ static void emit_get_var(sv_compiler_t *c, const char *name, uint32_t len) {
         emit_get_local(c, c->strict_args_local);
       } else {
         emit_op(c, OP_SPECIAL_OBJ);
-        emit(c, 0);
+        emit(c, SV_SPECIAL_ARGUMENTS);
       }
       return;
     }
@@ -1882,7 +1978,7 @@ static void compile_template_items(sv_compiler_t *c, sv_ast_t *node, int start) 
     if (has_value) emit_op(c, OP_ADD);
     has_value = true;
   }
-  if (!has_value) emit_constant(c, js_mkstr_permanent(c->js, "", 0));
+  if (!has_value) emit_constant(c, sv_const_str(c, "", 0));
 }
 
 static void compile_self_append_rhs(
@@ -1982,6 +2078,265 @@ static void add_global_lexical(sv_compiler_t *c, const char *name, uint32_t len,
   int atom = add_atom(c, name, len);
   c->global_lexicals[c->global_lexical_count++] =
     (sv_eval_decl_t){ .str = c->atoms[atom].str, .len = len, .is_const = is_const };
+}
+
+typedef struct {
+  const char *str;
+  uint32_t len;
+  bool is_function;
+} sv_decl_name_t;
+
+typedef struct {
+  sv_decl_name_t *items;
+  int count;
+  int cap;
+  sv_decl_name_t inline_items[16];
+} sv_decl_names_t;
+
+static inline void decl_names_init(sv_decl_names_t *names) {
+  names->items = names->inline_items;
+  names->count = 0;
+  names->cap = 16;
+}
+
+static inline void decl_names_free(sv_decl_names_t *names) {
+  if (names->items != names->inline_items) free(names->items);
+}
+
+static void decl_names_add(sv_decl_names_t *names, const char *str, uint32_t len, bool is_function) {
+  if (!str || !len) return;
+  if (names->count == names->cap) {
+    int cap = names->cap * 2;
+    sv_decl_name_t *items = names->items == names->inline_items
+      ? malloc((size_t)cap * sizeof(*items))
+      : realloc(names->items, (size_t)cap * sizeof(*items));
+    if (!items) return;
+    if (names->items == names->inline_items) memcpy(items, names->inline_items, sizeof(names->inline_items));
+    names->items = items;
+    names->cap = cap;
+  }
+  names->items[names->count++] = (sv_decl_name_t){ str, len, is_function };
+}
+
+static void collect_pattern_names(sv_ast_t *pat, sv_decl_names_t *out) {
+  if (!pat) return;
+  switch (pat->type) {
+    case N_IDENT: decl_names_add(out, pat->str, pat->len, false); break;
+    case N_ARRAY: case N_ARRAY_PAT:
+      for (int i = 0; i < pat->args.count; i++) collect_pattern_names(pat->args.items[i], out);
+      break;
+    case N_OBJECT: case N_OBJECT_PAT:
+      for (int i = 0; i < pat->args.count; i++) {
+        sv_ast_t *prop = pat->args.items[i];
+        if (prop && (prop->type == N_PROPERTY || prop->type == N_REST || prop->type == N_SPREAD))
+          collect_pattern_names(prop->right, out);
+      }
+      break;
+    case N_ASSIGN_PAT: case N_ASSIGN: collect_pattern_names(pat->left, out); break;
+    case N_REST: case N_SPREAD: collect_pattern_names(pat->right, out); break;
+    default: break;
+  }
+}
+
+static void collect_var_names(sv_ast_t *node, sv_decl_names_t *out) {
+  if (!node) return;
+  switch (node->type) {
+    case N_VAR:
+      if (node->var_kind == SV_VAR_VAR)
+        for (int i = 0; i < node->args.count; i++) {
+          sv_ast_t *decl = node->args.items[i];
+          if (decl && decl->type == N_VARDECL) collect_pattern_names(decl->left, out);
+        }
+      break;
+    case N_BLOCK:
+      for (int i = 0; i < node->args.count; i++) collect_var_names(node->args.items[i], out);
+      break;
+    case N_IF: collect_var_names(node->left, out); collect_var_names(node->right, out); break;
+    case N_WHILE: case N_DO_WHILE: case N_LABEL: collect_var_names(node->body, out); break;
+    case N_FOR: collect_var_names(node->init, out); collect_var_names(node->body, out); break;
+    case N_FOR_IN: case N_FOR_OF: case N_FOR_AWAIT_OF:
+      collect_var_names(node->left, out); collect_var_names(node->body, out); break;
+    case N_SWITCH:
+      for (int i = 0; i < node->args.count; i++) {
+        sv_ast_t *cas = node->args.items[i];
+        for (int j = 0; cas && j < cas->args.count; j++) collect_var_names(cas->args.items[j], out);
+      }
+      break;
+    case N_TRY:
+      collect_var_names(node->body, out);
+      collect_var_names(node->catch_body, out);
+      collect_var_names(node->finally_body, out);
+      break;
+    case N_EXPORT: collect_var_names(node->left, out); break;
+    default: break;
+  }
+}
+
+static inline bool is_function_declaration(sv_ast_t *node) {
+  return node && node->type == N_FUNC && node->str && !(node->flags & (FN_ARROW | FN_PAREN));
+}
+
+static void collect_lexical_names(sv_ast_list_t *stmts, bool functions_lexical, sv_decl_names_t *lex, sv_decl_names_t *vars) {
+  for (int i = 0; i < stmts->count; i++) {
+    sv_ast_t *node = stmts->items[i];
+    if (node && node->type == N_EXPORT) node = node->left;
+    if (!node) continue;
+    
+    if (node->type == N_VAR && node->var_kind != SV_VAR_VAR) {
+      for (int j = 0; j < node->args.count; j++) {
+        sv_ast_t *decl = node->args.items[j];
+        if (decl && decl->type == N_VARDECL) collect_pattern_names(decl->left, lex);
+      }
+    } else if (node->type == N_CLASS && node->str && (node->flags & FN_CLASS_DECL)) {
+      decl_names_add(lex, node->str, node->len, false);
+    } else if (is_function_declaration(node)) {
+      decl_names_add(functions_lexical ? lex : vars, node->str, node->len, true);
+    } else if (node->type == N_IMPORT_DECL) {
+      for (int j = 0; j < node->args.count; j++) {
+        sv_ast_t *spec = node->args.items[j];
+        if (spec && spec->type == N_IMPORT_SPEC && spec->right && spec->right->type == N_IDENT)
+          decl_names_add(lex, spec->right->str, spec->right->len, false);
+      }
+    }
+  }
+}
+
+static uint32_t decl_name_hash(const sv_decl_name_t *name) {
+  uint32_t h = 2166136261u;
+  for (uint32_t i = 0; i < name->len; i++) h = (h ^ (uint8_t)name->str[i]) * 16777619u;
+  return h;
+}
+
+static inline bool decl_name_eq(const sv_decl_name_t *a, const sv_decl_name_t *b) {
+  return a->len == b->len && memcmp(a->str, b->str, a->len) == 0;
+}
+
+static bool report_redeclaration(sv_compiler_t *c, const sv_decl_name_t *name) {
+  js_mkerr_typed(c->js, JS_ERR_SYNTAX, "Identifier '%.*s' has already been declared", (int)name->len, name->str);
+  return false;
+}
+
+static bool check_scope_declarations(
+  sv_compiler_t *c, const sv_decl_names_t *lex,
+  const sv_decl_names_t *vars, const sv_decl_names_t *params
+) {
+  if (lex->count == 0) return true;
+  
+  uint32_t size = 16;
+  while (size < (uint32_t)lex->count * 2) size *= 2;
+  int inline_table[64];
+  int *table = size <= 64 ? inline_table : malloc(size * sizeof(*table));
+  if (!table) return true;
+  for (uint32_t i = 0; i < size; i++) table[i] = -1;
+  
+  bool ok = true;
+  for (int i = 0; ok && i < lex->count; i++) {
+    uint32_t slot = decl_name_hash(&lex->items[i]) & (size - 1);
+    for (; table[slot] >= 0; slot = (slot + 1) & (size - 1)) {
+      const sv_decl_name_t *prev = &lex->items[table[slot]];
+      if (!decl_name_eq(prev, &lex->items[i])) continue;
+      if (!(prev->is_function && lex->items[i].is_function && !c->is_strict)) ok = report_redeclaration(c, &lex->items[i]);
+      break;
+    }
+    if (ok && table[slot] < 0) table[slot] = i;
+  }
+  
+  const sv_decl_names_t *others[2] = { vars, params };
+  for (int k = 0; ok && k < 2; k++) for (int i = 0; ok && others[k] && i < others[k]->count; i++) {
+    uint32_t slot = decl_name_hash(&others[k]->items[i]) & (size - 1);
+    for (; table[slot] >= 0; slot = (slot + 1) & (size - 1))
+      if (decl_name_eq(&lex->items[table[slot]], &others[k]->items[i])) { ok = report_redeclaration(c, &others[k]->items[i]); break; }
+  }
+  
+  if (table != inline_table) free(table);
+  return ok;
+}
+
+static inline void var_bloom_add(uint64_t bloom[4], uint32_t h) {
+  bloom[(h >> 6) & 3] |= 1ull << (h & 63);
+  bloom[(h >> 14) & 3] |= 1ull << ((h >> 8) & 63);
+}
+
+static inline bool var_bloom_may_contain(const uint64_t bloom[4], uint32_t h) {
+  return (bloom[(h >> 6) & 3] & (1ull << (h & 63))) && (bloom[(h >> 14) & 3] & (1ull << ((h >> 8) & 63)));
+}
+
+static void check_statement_list_declarations(
+  sv_compiler_t *c, sv_ast_list_t *stmts, bool functions_lexical,
+  const sv_decl_names_t *params, bool function_body
+) {
+  sv_decl_names_t lex, vars;
+  decl_names_init(&lex);
+  decl_names_init(&vars);
+  collect_lexical_names(stmts, functions_lexical, &lex, &vars);
+  
+  bool walk_vars = function_body;
+  if (!function_body) for (int i = 0; i < lex.count && !walk_vars; i++)
+    walk_vars = var_bloom_may_contain(c->var_name_bloom, decl_name_hash(&lex.items[i]));
+  
+  if (walk_vars) for (int i = 0; i < stmts->count; i++) collect_var_names(stmts->items[i], &vars);
+  if (function_body) {
+    memset(c->var_name_bloom, 0, sizeof(c->var_name_bloom));
+    for (int i = 0; i < vars.count; i++) var_bloom_add(c->var_name_bloom, decl_name_hash(&vars.items[i]));
+  }
+  
+  check_scope_declarations(c, &lex, &vars, params);
+  decl_names_free(&lex);
+  decl_names_free(&vars);
+}
+
+static bool lexical_names_may_be_vars(sv_compiler_t *c, const sv_decl_names_t *lex) {
+  for (int i = 0; i < lex->count; i++)
+    if (var_bloom_may_contain(c->var_name_bloom, decl_name_hash(&lex->items[i]))) return true;
+  return false;
+}
+
+static void check_switch_declarations(sv_compiler_t *c, sv_ast_t *node) {
+  sv_decl_names_t lex, vars;
+  decl_names_init(&lex);
+  decl_names_init(&vars);
+  for (int i = 0; i < node->args.count; i++) {
+    sv_ast_t *cas = node->args.items[i];
+    if (cas) collect_lexical_names(&cas->args, true, &lex, &vars);
+  }
+  if (lexical_names_may_be_vars(c, &lex)) for (int i = 0; i < node->args.count; i++) {
+    sv_ast_t *cas = node->args.items[i];
+    for (int j = 0; cas && j < cas->args.count; j++) collect_var_names(cas->args.items[j], &vars);
+  }
+  check_scope_declarations(c, &lex, &vars, NULL);
+  decl_names_free(&lex);
+  decl_names_free(&vars);
+}
+
+static void check_for_head_declarations(sv_compiler_t *c, sv_ast_t *head, sv_ast_t *body) {
+  if (!head || head->type != N_VAR || head->var_kind == SV_VAR_VAR) return;
+  sv_decl_names_t lex, vars;
+  decl_names_init(&lex);
+  decl_names_init(&vars);
+  for (int i = 0; i < head->args.count; i++) {
+    sv_ast_t *decl = head->args.items[i];
+    if (decl && decl->type == N_VARDECL) collect_pattern_names(decl->left, &lex);
+  }
+  if (lexical_names_may_be_vars(c, &lex)) collect_var_names(body, &vars);
+  check_scope_declarations(c, &lex, &vars, NULL);
+  decl_names_free(&lex);
+  decl_names_free(&vars);
+}
+
+static void check_catch_declarations(sv_compiler_t *c, sv_ast_t *param, sv_ast_t *body) {
+  if (!param || !body || body->type != N_BLOCK) return;
+  sv_decl_names_t names, body_lex, body_vars;
+  decl_names_init(&names);
+  decl_names_init(&body_lex);
+  decl_names_init(&body_vars);
+  collect_pattern_names(param, &names);
+  collect_lexical_names(&body->args, true, &body_lex, &body_vars);
+  if (param->type != N_IDENT && lexical_names_may_be_vars(c, &names))
+    for (int i = 0; i < body->args.count; i++) collect_var_names(body->args.items[i], &body_vars);
+  check_scope_declarations(c, &names, &body_lex, param->type != N_IDENT ? &body_vars : NULL);
+  decl_names_free(&names);
+  decl_names_free(&body_lex);
+  decl_names_free(&body_vars);
 }
 
 static void hoist_var_pattern(sv_compiler_t *c, sv_ast_t *pat) {
@@ -2115,51 +2470,51 @@ static void hoist_lexical_pattern(sv_compiler_t *c, sv_ast_t *pat,
   }
 }
 
-static void annex_b_collect_funcs(sv_ast_t *node, sv_ast_list_t *out) {
+static void annex_b_collect_funcs(ant_t *js, sv_ast_t *node, sv_ast_list_t *out) {
   if (!node) return;
   if (node->type == N_FUNC && node->str && !(node->flags & (FN_ARROW | FN_PAREN))) {
-    sv_ast_list_push(out, node);
+    sv_ast_list_push(js, out, node);
     return;
   }
   if (node->type == N_IF) {
-    annex_b_collect_funcs(node->left, out);
-    annex_b_collect_funcs(node->right, out);
-  } else if (node->type == N_LABEL) annex_b_collect_funcs(node->body, out);
+    annex_b_collect_funcs(js, node->left, out);
+    annex_b_collect_funcs(js, node->right, out);
+  } else if (node->type == N_LABEL) annex_b_collect_funcs(js, node->body, out);
 }
 
-static void annex_b_collect_block_var_funcs(sv_ast_t *node, sv_ast_list_t *out) {
+static void annex_b_collect_block_var_funcs(ant_t *js, sv_ast_t *node, sv_ast_list_t *out) {
   if (!node || node->type == N_FUNC || node->type == N_CLASS) return;
   if (node->type == N_BLOCK) {
     for (int i = 0; i < node->args.count; i++) {
       sv_ast_t *stmt = node->args.items[i];
       if (!stmt) continue;
       if (stmt->type == N_FUNC && stmt->str && !(stmt->flags & (FN_ARROW | FN_PAREN))) {
-        sv_ast_list_push(out, stmt);
+        sv_ast_list_push(js, out, stmt);
         continue;
       }
-      annex_b_collect_block_var_funcs(stmt, out);
+      annex_b_collect_block_var_funcs(js, stmt, out);
     }
     return;
   }
   if (node->type == N_IF) {
-    annex_b_collect_block_var_funcs(node->left, out);
-    annex_b_collect_block_var_funcs(node->right, out);
+    annex_b_collect_block_var_funcs(js, node->left, out);
+    annex_b_collect_block_var_funcs(js, node->right, out);
   } else if (node->type == N_LABEL) {
-    annex_b_collect_block_var_funcs(node->body, out);
+    annex_b_collect_block_var_funcs(js, node->body, out);
   } else if (node->type == N_WHILE || node->type == N_DO_WHILE) {
-    annex_b_collect_block_var_funcs(node->body, out);
+    annex_b_collect_block_var_funcs(js, node->body, out);
   } else if (node->type == N_FOR || node->type == N_FOR_IN || node->type == N_FOR_OF || node->type == N_FOR_AWAIT_OF) {
-    annex_b_collect_block_var_funcs(node->body, out);
+    annex_b_collect_block_var_funcs(js, node->body, out);
   } else if (node->type == N_SWITCH) {
     for (int i = 0; i < node->args.count; i++) {
       sv_ast_t *cas = node->args.items[i];
       for (int j = 0; cas && j < cas->args.count; j++)
-        annex_b_collect_block_var_funcs(cas->args.items[j], out);
+        annex_b_collect_block_var_funcs(js, cas->args.items[j], out);
     }
   } else if (node->type == N_TRY) {
-    annex_b_collect_block_var_funcs(node->body, out);
-    annex_b_collect_block_var_funcs(node->catch_body, out);
-    annex_b_collect_block_var_funcs(node->finally_body, out);
+    annex_b_collect_block_var_funcs(js, node->body, out);
+    annex_b_collect_block_var_funcs(js, node->catch_body, out);
+    annex_b_collect_block_var_funcs(js, node->finally_body, out);
   }
 }
 
@@ -2179,7 +2534,7 @@ static void mark_export_binding_as(
     slot = &(*slot)->next;
   }
 
-  sv_export_name_t *node = code_arena_bump(sizeof(sv_export_name_t));
+  sv_export_name_t *node = sv_code_bump(c->js, sizeof(sv_export_name_t));
   if (!node) return;
   node->name = export_name;
   node->len = export_name_len;
@@ -2308,7 +2663,7 @@ static void hoist_lexical_decls(sv_compiler_t *c, sv_ast_list_t *stmts) {
     }
     if (!c->is_strict && (decl_node->type == N_IF || decl_node->type == N_LABEL)) {
       sv_ast_list_t funcs = {0};
-      annex_b_collect_funcs(decl_node, &funcs);
+      annex_b_collect_funcs(c->js, decl_node, &funcs);
       for (int j = 0; j < funcs.count; j++) {
         sv_ast_t *fn = funcs.items[j];
         if (is_sloppy_eval(c) && c->scope_depth == 0) add_eval_var(c, fn->str, fn->len, true);
@@ -2318,7 +2673,7 @@ static void hoist_lexical_decls(sv_compiler_t *c, sv_ast_list_t *stmts) {
     }
     if (!c->is_strict) {
       sv_ast_list_t funcs = {0};
-      annex_b_collect_block_var_funcs(decl_node, &funcs);
+      annex_b_collect_block_var_funcs(c->js, decl_node, &funcs);
       for (int j = 0; j < funcs.count; j++) {
         sv_ast_t *fn = funcs.items[j];
         if (is_sloppy_eval(c)) add_eval_var(c, fn->str, fn->len, true);
@@ -2375,7 +2730,9 @@ static void emit_closure(sv_compiler_t *c, int index) {
   sv_func_t *child = (sv_func_t *)vptr(c->constants[index]);
   uint32_t scope = 0;
   if (child->needs_eval_env && !capture_dynamic_eval_scope(c, &scope)) return;
-  emit_op(c, child->needs_eval_env ? OP_CLOSURE_EVAL : OP_CLOSURE);
+  sv_op_t op = child->needs_eval_env ? OP_CLOSURE_EVAL
+    : (!c->is_strict && c->strict_args_local >= 0) ? OP_CLOSURE_ARGS : OP_CLOSURE;
+  emit_op(c, op);
   emit_u32(c, (uint32_t)index);
   if (child->needs_eval_env) emit_u32(c, scope);
 }
@@ -2420,7 +2777,7 @@ static void hoist_func_decls(sv_compiler_t *c, sv_ast_list_t *stmts) {
     }
     if (!c->is_strict && (node->type == N_IF || node->type == N_LABEL)) {
       sv_ast_list_t funcs = {0};
-      annex_b_collect_funcs(node, &funcs);
+      annex_b_collect_funcs(c->js, node, &funcs);
       for (int j = 0; j < funcs.count; j++)
         hoist_one_func(c, funcs.items[j], false);
     }
@@ -2435,13 +2792,13 @@ static uint8_t infer_expr_type(sv_compiler_t *c, sv_ast_t *node) {
     case N_STRING:   return SV_TI_STR;
     case N_BOOL:     return SV_TI_BOOL;
     case N_NULL:     return SV_TI_NULL;
-    case N_UNDEF:    return SV_TI_UNDEF;
     case N_ARRAY:    return SV_TI_ARR;
     case N_OBJECT:   return SV_TI_OBJ;
     case N_TEMPLATE: return SV_TI_STR;
     case N_TYPEOF:   return SV_TI_STR;
     case N_VOID:     return SV_TI_UNDEF;
     case N_NEW:      return SV_TI_OBJ;
+    case N_UNDEF:    return undefined_shadowed(c) ? SV_TI_UNKNOWN : SV_TI_UNDEF;
 
     case N_IDENT: {
       int local = resolve_local(c, node->str, node->len);
@@ -2545,7 +2902,7 @@ void compile_expr(sv_compiler_t *c, sv_ast_t *node) {
       uint32_t dlen = node->len;
       if (dlen > 0 && digits[0] == '-') { neg = true; digits++; dlen--; }
       if (dlen > 0 && digits[dlen - 1] == 'n') dlen--;
-      ant_value_t bi = js_mkbigint_permanent(c->js, digits, dlen, neg);
+      ant_value_t bi = sv_const_bigint(c, digits, dlen, neg);
       emit_constant(c, bi);
       break;
     }
@@ -2559,7 +2916,8 @@ void compile_expr(sv_compiler_t *c, sv_ast_t *node) {
       break;
 
     case N_UNDEF:
-      emit_op(c, OP_UNDEF);
+      if (undefined_shadowed(c)) emit_get_var(c, "undefined", 9);
+      else emit_op(c, OP_UNDEF);
       break;
 
     case N_THIS:
@@ -2567,7 +2925,8 @@ void compile_expr(sv_compiler_t *c, sv_ast_t *node) {
       break;
 
     case N_GLOBAL_THIS:
-      emit_op(c, OP_GLOBAL);
+      if (global_this_shadowed(c)) emit_get_var(c, "globalThis", 10);
+      else emit_op(c, OP_GLOBAL);
       break;
 
     case N_NEW_TARGET: {
@@ -2664,6 +3023,8 @@ void compile_expr(sv_compiler_t *c, sv_ast_t *node) {
       break;
 
     case N_AWAIT:
+      if (!await_allowed(c)) js_mkerr_typed(c->js, JS_ERR_SYNTAX,
+        "await is only valid in async functions and the top level bodies of modules");
       compile_expr(c, node->right);
       emit_op(c, OP_AWAIT);
       if (c->enclosing && !c->enclosing->enclosing)
@@ -2712,7 +3073,7 @@ void compile_expr(sv_compiler_t *c, sv_ast_t *node) {
         if (!is_template_segment(item)) continue;
         const char *raw = item->aux ? item->aux : item->str;
         uint32_t raw_len = item->aux ? item->aux_len : item->len;
-        emit_constant(c, js_mkstr_permanent(c->js, raw ? raw : "", raw_len));
+        emit_constant(c, sv_const_str(c, raw ? raw : "", raw_len));
       }
       emit_op(c, OP_ARRAY);
       emit_u16(c, (uint16_t)n_strings);
@@ -2760,8 +3121,8 @@ void compile_expr(sv_compiler_t *c, sv_ast_t *node) {
       break;
 
     case N_REGEXP:
-      emit_constant(c, js_mkstr_permanent(c->js, node->str ? node->str : "", node->len));
-      emit_constant(c, js_mkstr_permanent(c->js, node->aux ? node->aux : "", node->aux_len));
+      emit_constant(c, sv_const_str(c, node->str ? node->str : "", node->len));
+      emit_constant(c, sv_const_str(c, node->aux ? node->aux : "", node->aux_len));
       emit_op(c, OP_REGEXP);
       break;
 
@@ -3263,7 +3624,7 @@ static void compile_typeof_op(sv_compiler_t *c, sv_ast_t *node, int test_type) {
       uint8_t inferred = get_local_inferred_type(c, local);
       const char *known = typeof_name_for_type(inferred);
       if (test_type < 0 && known && c->with_depth == 0 && c->locals[local].is_const) {
-        emit_constant(c, js_mkstr_permanent(c->js, known, strlen(known)));
+        emit_constant(c, sv_const_str(c, known, strlen(known)));
         return;
       }
       emit_get_var(c, arg->str, arg->len);
@@ -3291,7 +3652,7 @@ static void compile_typeof_op(sv_compiler_t *c, sv_ast_t *node, int test_type) {
           emit_get_local(c, c->strict_args_local);
         } else {
           emit_op(c, OP_SPECIAL_OBJ);
-          emit(c, 0);
+          emit(c, SV_SPECIAL_ARGUMENTS);
         }
       } else if (c->with_depth > 0) emit_with_get(c, arg->str, arg->len, WITH_FB_GLOBAL_UNDEF, 0);
       else emit_atom_op(
@@ -3330,7 +3691,7 @@ static void compile_delete_optional(sv_compiler_t *c, sv_ast_t *arg) {
   if (arg->flags & 1) {
     compile_expr(c, arg->right);
   } else {
-    ant_value_t key = js_mkstr_permanent(c->js, arg->right->str, arg->right->len);
+    ant_value_t key = sv_const_str(c, arg->right->str, arg->right->len);
     emit_constant(c, key);
   }
   emit_op(c, OP_DELETE);
@@ -3351,7 +3712,7 @@ void compile_delete(sv_compiler_t *c, sv_ast_t *node) {
     compile_delete_optional(c, arg);
   } else if (arg->type == N_MEMBER && !(arg->flags & 1)) {
     compile_expr(c, arg->left);
-    ant_value_t key = js_mkstr_permanent(c->js, arg->right->str, arg->right->len);
+    ant_value_t key = sv_const_str(c, arg->right->str, arg->right->len);
     emit_constant(c, key);
     emit_op(c, OP_DELETE);
   } else if (arg->type == N_MEMBER && (arg->flags & 1)) {
@@ -3382,7 +3743,7 @@ void compile_delete(sv_compiler_t *c, sv_ast_t *node) {
 void compile_template(sv_compiler_t *c, sv_ast_t *node) {
   int n = node->args.count;
   if (n == 0) {
-    emit_constant(c, js_mkstr_permanent(c->js, "", 0));
+    emit_constant(c, sv_const_str(c, "", 0));
     return;
   }
   if (!template_has_valid_cooked_segments(node)) {
@@ -3588,7 +3949,7 @@ static sv_call_kind_t compile_call_setup_non_optional(sv_compiler_t *c, sv_ast_t
     if (c->is_arrow) emit_lexical_new_target(c);
     else {
       emit_op(c, OP_SPECIAL_OBJ);
-      emit(c, 1);
+      emit(c, SV_SPECIAL_NEW_TARGET);
     }
     return SV_CALL_SUPER;
   }
@@ -3605,7 +3966,7 @@ static sv_call_kind_t compile_call_setup_non_optional(sv_compiler_t *c, sv_ast_t
     if (callee->flags & 1)
       compile_expr(c, callee->right);
     else
-      emit_constant(c, js_mkstr_permanent(c->js, callee->right->str, callee->right->len));
+      emit_constant(c, sv_const_str(c, callee->right->str, callee->right->len));
     emit_op(c, OP_GET_SUPER_VAL);
     return SV_CALL_METHOD;
   }
@@ -3847,8 +4208,8 @@ static bool compile_regexp_literal_exec_intrinsic(
   if (!regexp_literal_exec_arg_is_simple(c, node->args.items[0])) return false;
 
   sv_ast_t *rx = callee->left;
-  emit_constant(c, js_mkstr_permanent(c->js, rx->str ? rx->str : "", rx->len));
-  emit_constant(c, js_mkstr_permanent(c->js, rx->aux ? rx->aux : "", rx->aux_len));
+  emit_constant(c, sv_const_str(c, rx->str ? rx->str : "", rx->len));
+  emit_constant(c, sv_const_str(c, rx->aux ? rx->aux : "", rx->aux_len));
   compile_expr(c, node->args.items[0]);
   emit_op(c, OP_RE_LITERAL_EXEC);
   return true;
@@ -3872,8 +4233,8 @@ static bool compile_string_regexp_literal_replace_intrinsic(
   if (replacement->str && memchr(replacement->str, '$', replacement->len)) return false;
 
   compile_expr(c, callee->left);
-  emit_constant(c, js_mkstr_permanent(c->js, rx->str ? rx->str : "", rx->len));
-  emit_constant(c, js_mkstr_permanent(c->js, rx->aux ? rx->aux : "", rx->aux_len));
+  emit_constant(c, sv_const_str(c, rx->str ? rx->str : "", rx->len));
+  emit_constant(c, sv_const_str(c, rx->aux ? rx->aux : "", rx->aux_len));
   compile_expr(c, replacement);
   emit_op(c, OP_STR_RE_LITERAL_REPLACE);
   return true;
@@ -4011,7 +4372,7 @@ static bool func_params_contain_await(const sv_ast_t *node) {
   return false;
 }
 
-static bool collect_param_bindings(sv_ast_t *param, sv_ast_list_t *names) {
+static bool collect_param_bindings(ant_t *js, sv_ast_t *param, sv_ast_list_t *names) {
   static const void *dispatch[N__COUNT] = {
     [N_IDENT]      = &&l_ident,
     [N_ASSIGN]     = &&l_left,
@@ -4031,17 +4392,17 @@ static bool collect_param_bindings(sv_ast_t *param, sv_ast_list_t *names) {
 
 l_ident:
   if (!param->len) return true;
-  return sv_ast_list_push(names, param);
+  return sv_ast_list_push(js, names, param);
 
 l_left:
-  return collect_param_bindings(param->left, names);
+  return collect_param_bindings(js, param->left, names);
 
 l_right:
-  return collect_param_bindings(param->right, names);
+  return collect_param_bindings(js, param->right, names);
 
 l_items:
   for (int i = 0; i < param->args.count; i++)
-    if (!collect_param_bindings(param->args.items[i], names)) return false;
+    if (!collect_param_bindings(js, param->args.items[i], names)) return false;
   return true;
 }
 
@@ -4057,7 +4418,7 @@ static bool check_function_param_names(ant_t *js, sv_ast_t *fn, bool strict, boo
   sv_ast_list_t names = {.items = items, .cap = sizeof(items) / sizeof(items[0])};
 
   for (int i = 0; i < fn->args.count; i++) {
-    if (collect_param_bindings(fn->args.items[i], &names)) continue;
+    if (collect_param_bindings(js, fn->args.items[i], &names)) continue;
     if (emit_error) js_mkerr(js, "out of memory");
     return false;
   }
@@ -4218,12 +4579,19 @@ static bool compile_inline_literal_eval(sv_compiler_t *c, sv_ast_t *node) {
   ant_value_t saved_exception = Ant_Exception_Peek(c->js);
   GC_ROOT_PIN(c->js, saved_exception);
 
-  code_arena_mark_t mark = parse_arena_mark();
-  const char *source = pin_source_text(arg->str ? arg->str : "", arg->len);
-  sv_ast_t *program = sv_parse(c->js, source ? source : "", arg->len, c->is_strict);
+  code_arena_mark_t mark = parse_arena_mark(c->js);
+  const char *source = copy_source_text(c->js, arg->str ? arg->str : "", arg->len);
+  
+  if (!source) {
+    parse_arena_rewind(c->js, mark);
+    GC_ROOT_RESTORE(c->js, exception_mark);
+    return false;
+  }
+  
+  sv_ast_t *program = sv_parse(c->js, source, arg->len, SV_PARSE_SCRIPT, c->is_strict);
 
   if (!program) {
-    parse_arena_rewind(mark);
+    parse_arena_rewind(c->js, mark);
     Ant_Exception_Set(c->js, saved_exception);
     GC_ROOT_RESTORE(c->js, exception_mark);
     return false;
@@ -4239,7 +4607,7 @@ static bool compile_inline_literal_eval(sv_compiler_t *c, sv_ast_t *node) {
     inline_eval_can_compile_without_early_errors(c->js, program->args.items[0], c->is_strict) &&
     !ast_contains_direct_suspend(program->args.items[0], NULL)
   ) expr = program->args.items[0]; else {
-    parse_arena_rewind(mark);
+    parse_arena_rewind(c->js, mark);
     Ant_Exception_Set(c->js, saved_exception);
     GC_ROOT_RESTORE(c->js, exception_mark);
     return false;
@@ -4253,7 +4621,7 @@ static bool compile_inline_literal_eval(sv_compiler_t *c, sv_ast_t *node) {
   if (expr) compile_expr(c, expr);
   else emit_op(c, OP_UNDEF);
 
-  parse_arena_rewind(mark);
+  parse_arena_rewind(c->js, mark);
   GC_ROOT_RESTORE(c->js, exception_mark);
 
   return true;
@@ -4456,17 +4824,17 @@ void compile_call(sv_compiler_t *c, sv_ast_t *node) {
     node->args.items[1]->type == N_OBJECT
   ) {
     sv_ast_t *obj = node->args.items[1];
-    sv_ast_t *param = sv_ast_new(N_IDENT);
+    sv_ast_t *param = sv_ast_new(c->js, N_IDENT);
     
     param->str = "$"; param->len = 1;
-    sv_ast_t *arrow = sv_ast_new(N_FUNC);
+    sv_ast_t *arrow = sv_ast_new(c->js, N_FUNC);
     
     arrow->flags = FN_ARROW;
     arrow->body = obj;
     arrow->line = obj->line; arrow->col = obj->col;
     arrow->src_off = obj->src_off; arrow->src_end = obj->src_end;
     
-    sv_ast_list_push(&arrow->args, param);
+    sv_ast_list_push(c->js, &arrow->args, param);
     node->args.items[1] = arrow;
   }
 
@@ -4518,8 +4886,17 @@ void compile_member(sv_compiler_t *c, sv_ast_t *node) {
     if (node->flags & 1)
       compile_expr(c, node->right);
     else
-      emit_constant(c, js_mkstr_permanent(c->js, node->right->str, node->right->len));
+      emit_constant(c, sv_const_str(c, node->right->str, node->right->len));
     emit_op(c, OP_GET_SUPER_VAL);
+    return;
+  }
+
+  if (
+    c->args_length_only && !c->owns_eval_env &&
+    has_implicit_arguments_obj(c) && ast_is_arguments_length(node)
+  ) {
+    emit_op(c, OP_SPECIAL_OBJ);
+    emit(c, SV_SPECIAL_ARGC);
     return;
   }
 
@@ -4802,7 +5179,7 @@ static void emit_build_object_rest(sv_compiler_t *c) {
 static void emit_delete_rest_key(sv_compiler_t *c, sv_ast_t *key) {
   emit_op(c, OP_DUP);
   if (key->type == N_IDENT) {
-    emit_constant(c, js_mkstr_permanent(c->js, key->str, key->len));
+    emit_constant(c, sv_const_str(c, key->str, key->len));
   } else if (key->type == N_STRING) {
     emit_constant(c, ast_string_const(c, key));
   } else if (key->type == N_NUMBER) {
@@ -5235,6 +5612,7 @@ static void compile_block_with_using(sv_compiler_t *c, sv_ast_t *node) {
   bool has_using = stmt_list_has_using_decl(&node->args, &has_await_using);
 
   begin_scope(c);
+  check_statement_list_declarations(c, &node->args, true, NULL, false);
   hoist_lexical_decls(c, &node->args);
   hoist_func_decls(c, &node->args);
 
@@ -5872,6 +6250,7 @@ static void for_collect_var_decl_slots(sv_compiler_t *c, sv_ast_t *init_var, int
 
 void compile_for(sv_compiler_t *c, sv_ast_t *node) {
   emit_set_completion_undefined(c);
+  check_for_head_declarations(c, node->init, node->body);
   begin_scope(c);
 
   int *iter_slots = NULL;
@@ -6048,6 +6427,7 @@ static bool compile_using_push_target(sv_compiler_t *c, sv_ast_t *lhs, int stack
 
 static void compile_for_each(sv_compiler_t *c, sv_ast_t *node, bool is_for_of) {
   emit_set_completion_undefined(c);
+  check_for_head_declarations(c, node->left, node->body);
   begin_scope(c);
 
   int *iter_slots = NULL;
@@ -6103,6 +6483,8 @@ static void compile_for_each(sv_compiler_t *c, sv_ast_t *node, bool is_for_of) {
   int using_stack_local = -1;
 
   bool is_for_await = (node->type == N_FOR_AWAIT_OF);
+  if (is_for_await && !await_allowed(c))
+    js_mkerr_typed(c->js, JS_ERR_SYNTAX, "Unexpected reserved word");
   bool is_using_loop = node->left && node->left->type == N_VAR &&
     (node->left->var_kind == SV_VAR_USING || node->left->var_kind == SV_VAR_AWAIT_USING);
   bool is_await_using_loop = is_using_loop && node->left->var_kind == SV_VAR_AWAIT_USING;
@@ -6342,6 +6724,7 @@ static void compile_finally_block(sv_compiler_t *c, sv_ast_t *finally_body) {
 }
 
 static void compile_catch_body(sv_compiler_t *c, sv_ast_t *node) {
+  check_catch_declarations(c, node->catch_param, node->catch_body);
   begin_scope(c);
   if (node->catch_param && node->catch_param->type == N_IDENT) {
     int loc = add_local(c, node->catch_param->str, node->catch_param->len, false, c->scope_depth);
@@ -6432,6 +6815,7 @@ void compile_switch(sv_compiler_t *c, sv_ast_t *node) {
 
   compile_expr(c, node->cond);  
   begin_scope(c);
+  check_switch_declarations(c, node);
   push_loop(c, c->code_len, NULL, 0, true);
 
   for (int i = 0; i < case_count; i++) {
@@ -6599,7 +6983,7 @@ static int compile_static_child_function(sv_compiler_t *c, sv_ast_t *node, bool 
   static const char sv_name[] = "\x01super";
   comp.super_local = add_local(&comp, sv_name, sizeof(sv_name) - 1, false, comp.scope_depth);
   emit_op(&comp, OP_SPECIAL_OBJ);
-  emit(&comp, 2);
+  emit(&comp, SV_SPECIAL_SUPER);
   emit_put_local(&comp, comp.super_local);
 
   if (returns_expr) {
@@ -6607,41 +6991,36 @@ static int compile_static_child_function(sv_compiler_t *c, sv_ast_t *node, bool 
     else emit_op(&comp, OP_UNDEF);
     emit_return_from_stack(&comp);
   } else {
+    check_statement_list_declarations(&comp, &node->args, false, NULL, true);
     compile_stmts(&comp, &node->args);
     emit_close_upvals(&comp);
     emit_op(&comp, OP_RETURN_UNDEF);
   }
 
-  sv_func_t *fn = code_arena_bump(sizeof(sv_func_t));
-  memset(fn, 0, sizeof(sv_func_t));
-  fn->debug = code_arena_bump(sizeof(sv_func_debug_t));
-  memset(fn->debug, 0, sizeof(sv_func_debug_t));
+  sv_func_t *fn = sv_func_new(c->js);
   sv_func_init_code_and_map_templates(&comp, fn);
   sv_func_init_obj_sites(&comp, fn);
 
   if (comp.const_count > 0) {
-    fn->constants = code_arena_bump((size_t)comp.const_count * sizeof(ant_value_t));
+    fn->constants = sv_code_bump(c->js, (size_t)comp.const_count * sizeof(ant_value_t));
     memcpy(fn->constants, comp.constants, (size_t)comp.const_count * sizeof(ant_value_t));
     fn->const_count = comp.const_count;
-    build_gc_const_tables(fn);
+    if (!build_gc_const_tables(comp.js, fn)) js_mkerr(comp.js, "out of memory building constant tables");
   }
   if (comp.atom_count > 0) {
-    fn->atoms = code_arena_bump((size_t)comp.atom_count * sizeof(sv_atom_t));
+    fn->atoms = sv_code_bump(c->js, (size_t)comp.atom_count * sizeof(sv_atom_t));
     memcpy(fn->atoms, comp.atoms, (size_t)comp.atom_count * sizeof(sv_atom_t));
     fn->atom_count = comp.atom_count;
   }
   fn->ic_count = (uint16_t)comp.ic_count;
-  if (fn->ic_count > 0) {
-    fn->ic_slots = code_arena_bump((size_t)fn->ic_count * sizeof(sv_ic_entry_t));
-    memset(fn->ic_slots, 0, (size_t)fn->ic_count * sizeof(sv_ic_entry_t));
-  }
+  fn->ic_slots = alloc_ic_slots(c->js, fn->ic_count);
   if (comp.upvalue_count > 0) {
-    fn->upval_descs = code_arena_bump((size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
+    fn->upval_descs = sv_code_bump(c->js, (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
     memcpy(fn->upval_descs, comp.upval_descs, (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
     fn->upvalue_count = comp.upvalue_count;
   }
   if (comp.srcpos_count > 0) {
-    fn->debug->srcpos = code_arena_bump((size_t)comp.srcpos_count * sizeof(sv_srcpos_t));
+    fn->debug->srcpos = sv_code_bump(c->js, (size_t)comp.srcpos_count * sizeof(sv_srcpos_t));
     memcpy(fn->debug->srcpos, comp.srcpos, (size_t)comp.srcpos_count * sizeof(sv_srcpos_t));
     fn->debug->srcpos_count = comp.srcpos_count;
   }
@@ -6830,11 +7209,11 @@ void compile_class(sv_compiler_t *c, sv_ast_t *node) {
     if (node->left) {
       emit_op(&comp, OP_THIS);
       emit_op(&comp, OP_SPECIAL_OBJ);
-      emit(&comp, 2);
+      emit(&comp, SV_SPECIAL_SUPER);
       emit_op(&comp, OP_SPECIAL_OBJ);
-      emit(&comp, 1);
+      emit(&comp, SV_SPECIAL_NEW_TARGET);
       emit_op(&comp, OP_SPECIAL_OBJ);
-      emit(&comp, 0);
+      emit(&comp, SV_SPECIAL_ARGUMENTS);
       emit_op(&comp, OP_SUPER_APPLY);
       emit_u16(&comp, 1);
       emit_op(&comp, OP_POP);
@@ -6843,34 +7222,26 @@ void compile_class(sv_compiler_t *c, sv_ast_t *node) {
     emit_field_inits(&comp, c, field_inits, field_count);
     emit_op(&comp, OP_RETURN_UNDEF);
 
-    sv_func_t *fn = code_arena_bump(sizeof(sv_func_t));
-    memset(fn, 0, sizeof(sv_func_t));
-  fn->debug = code_arena_bump(sizeof(sv_func_debug_t));
-  memset(fn->debug, 0, sizeof(sv_func_debug_t));
+    sv_func_t *fn = sv_func_new(c->js);
     fn->is_derived_ctor = node->left != NULL;
     sv_func_init_code_and_map_templates(&comp, fn);
     sv_func_init_obj_sites(&comp, fn);
     if (comp.const_count > 0) {
-      fn->constants = code_arena_bump((size_t)comp.const_count * sizeof(ant_value_t));
+      fn->constants = sv_code_bump(c->js, (size_t)comp.const_count * sizeof(ant_value_t));
       memcpy(fn->constants, comp.constants, (size_t)comp.const_count * sizeof(ant_value_t));
       fn->const_count = comp.const_count;
-      build_gc_const_tables(fn);
+      if (!build_gc_const_tables(comp.js, fn)) js_mkerr(comp.js, "out of memory building constant tables");
     }
     if (comp.atom_count > 0) {
-      fn->atoms = code_arena_bump((size_t)comp.atom_count * sizeof(sv_atom_t));
+      fn->atoms = sv_code_bump(c->js, (size_t)comp.atom_count * sizeof(sv_atom_t));
       memcpy(fn->atoms, comp.atoms, (size_t)comp.atom_count * sizeof(sv_atom_t));
       fn->atom_count = comp.atom_count;
     }
     fn->ic_count = (uint16_t)comp.ic_count;
-    if (fn->ic_count > 0) {
-      fn->ic_slots = code_arena_bump((size_t)fn->ic_count * sizeof(sv_ic_entry_t));
-      memset(fn->ic_slots, 0, (size_t)fn->ic_count * sizeof(sv_ic_entry_t));
-    }
+    fn->ic_slots = alloc_ic_slots(c->js, fn->ic_count);
     if (comp.upvalue_count > 0) {
-      fn->upval_descs = code_arena_bump(
-        (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
-      memcpy(fn->upval_descs, comp.upval_descs,
-             (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
+      fn->upval_descs = sv_code_bump(c->js, (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
+      memcpy(fn->upval_descs, comp.upval_descs, (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
       fn->upvalue_count = comp.upvalue_count;
     }
     fn->max_locals = comp.max_local_count;
@@ -6884,7 +7255,7 @@ void compile_class(sv_compiler_t *c, sv_ast_t *node) {
     fn->debug->source_line = (int)node->line;
     
     if (node->str && node->len > 0) {
-      char *name = code_arena_bump(node->len + 1);
+      char *name = sv_code_bump(c->js, node->len + 1);
       memcpy(name, node->str, node->len);
       name[node->len] = '\0';
       fn->debug->name = name;
@@ -7004,6 +7375,7 @@ static bool sv_func_compute_fusable_leaf(sv_func_t *func) {
     sv_op_t op = (sv_op_t)*ip;
     switch (op) {
       case OP_CLOSURE_EVAL:
+      case OP_CLOSURE_ARGS:
       case OP_INIT_EVAL_ENV:
       case OP_CLOSURE:
       case OP_THIS:
@@ -7071,28 +7443,12 @@ static bool sv_func_compute_curried_step(sv_func_t *func) {
   return child->is_fusable_leaf;
 }
 
-static bool ast_pattern_binds_eval(const sv_ast_t *node) {
-  if (!node) return false;
-  switch (node->type) {
-    case N_IDENT: return is_ident_name(node, "eval");
-    case N_ASSIGN: case N_ASSIGN_PAT:
-      return ast_pattern_binds_eval(node->left);
-    case N_REST: case N_SPREAD: case N_PROPERTY:
-      return ast_pattern_binds_eval(node->right);
-    case N_ARRAY: case N_ARRAY_PAT: case N_OBJECT: case N_OBJECT_PAT:
-      for (int i = 0; i < node->args.count; i++)
-        if (ast_pattern_binds_eval(node->args.items[i])) return true;
-      return false;
-    default: return false;
-  }
-}
-
 static bool ast_decl_binds_eval(const sv_ast_t *node) {
   if (!node) return false;
   if (node->type == N_EXPORT) return ast_decl_binds_eval(node->left);
   if (node->type == N_VAR) {
     for (int i = 0; i < node->args.count; i++)
-      if (ast_pattern_binds_eval(node->args.items[i]->left)) return true;
+      if (ast_pattern_binds(node->args.items[i]->left, "eval")) return true;
   }
   if ((node->type == N_FUNC && !(node->flags & (FN_ARROW | FN_PAREN))) ||
       (node->type == N_CLASS && (node->flags & FN_CLASS_DECL)))
@@ -7132,7 +7488,7 @@ static bool ast_has_own_eval(sv_compiler_t *c, const sv_ast_t *node) {
        ast_decl_binds_eval(node->left))) return false;
   if (node->type == N_TRY) {
     return ast_has_own_eval(c, node->body) ||
-      (!ast_pattern_binds_eval(node->catch_param) && ast_has_own_eval(c, node->catch_body)) ||
+      (!ast_pattern_binds(node->catch_param, "eval") && ast_has_own_eval(c, node->catch_body)) ||
       ast_has_own_eval(c, node->finally_body);
   }
   if (node->type == N_CALL && !call_has_spread_arg(node) &&
@@ -7145,15 +7501,15 @@ static bool ast_has_own_eval(sv_compiler_t *c, const sv_ast_t *node) {
       GC_ROOT_SAVE(exception_mark, c->js);
       ant_value_t saved_exception = Ant_Exception_Peek(c->js);
       GC_ROOT_PIN(c->js, saved_exception);
-      code_arena_mark_t mark = parse_arena_mark();
-      sv_ast_t *program = sv_parse(c->js, arg->str ? arg->str : "", arg->len, c->is_strict);
+      code_arena_mark_t mark = parse_arena_mark(c->js);
+      sv_ast_t *program = sv_parse(c->js, arg->str ? arg->str : "", arg->len, SV_PARSE_SCRIPT, c->is_strict);
       bool needs_env = !program || (program->args.count != 0 &&
         (program->args.count != 1 ||
          !is_inline_literal_eval_expr(program->args.items[0]) ||
          !inline_eval_can_compile_without_early_errors(c->js, program->args.items[0], c->is_strict) ||
          ast_contains_direct_suspend(program->args.items[0], NULL) ||
          ast_has_own_eval(c, program->args.items[0])));
-      parse_arena_rewind(mark);
+      parse_arena_rewind(c->js, mark);
       Ant_Exception_Set(c->js, saved_exception);
       GC_ROOT_RESTORE(c->js, exception_mark);
       if (needs_env) return true;
@@ -7212,7 +7568,7 @@ sv_func_t *compile_function_body(
   comp.param_locals = comp.local_count;
   bool params_bind_eval = false;
   for (int i = 0; i < node->args.count; i++)
-    params_bind_eval |= ast_pattern_binds_eval(node->args.items[i]);
+    params_bind_eval |= ast_pattern_binds(node->args.items[i], "eval");
   if (!sv_compile_mode_is_eval(mode) && !is_repl_root(&comp) && !comp.is_strict && !params_bind_eval) {
     for (int i = 0; !comp.owns_eval_env && i < node->args.count; i++)
       comp.owns_eval_env = ast_has_own_eval(&comp, node->args.items[i]);
@@ -7227,7 +7583,7 @@ sv_func_t *compile_function_body(
     static const char nt_name[] = "\x01new.target";
     comp.new_target_local = add_local(&comp, nt_name, sizeof(nt_name) - 1, false, comp.scope_depth);
     emit_op(&comp, OP_SPECIAL_OBJ);
-    emit(&comp, 1);
+    emit(&comp, SV_SPECIAL_NEW_TARGET);
     emit_put_local(&comp, comp.new_target_local);
   }
   
@@ -7394,11 +7750,14 @@ sv_func_t *compile_function_body(
     }
   }
 
-  if (!comp.is_arrow && has_implicit_arguments_obj(&comp) && (node->flags & FN_USES_ARGS)) {
+  if (
+    !comp.is_arrow && !comp.args_length_only &&
+    has_implicit_arguments_obj(&comp) && (node->flags & FN_USES_ARGS)
+  ) {
     static const char args_name[] = "\x01arguments";
     comp.strict_args_local = add_local(&comp, args_name, sizeof(args_name) - 1, false, comp.scope_depth);
     emit_op(&comp, OP_SPECIAL_OBJ);
-    emit(&comp, 0);
+    emit(&comp, SV_SPECIAL_ARGUMENTS);
     emit_put_local(&comp, comp.strict_args_local);
   }
 
@@ -7406,7 +7765,7 @@ sv_func_t *compile_function_body(
     static const char sv_name[] = "\x01super";
     comp.super_local = add_local(&comp, sv_name, sizeof(sv_name) - 1, false, comp.scope_depth);
     emit_op(&comp, OP_SPECIAL_OBJ);
-    emit(&comp, 2);
+    emit(&comp, SV_SPECIAL_SUPER);
     emit_put_local(&comp, comp.super_local);
   }
 
@@ -7449,6 +7808,15 @@ sv_func_t *compile_function_body(
     should_emit_module_static_declarations(&comp, node->body);
   if (emitted_static_declarations)
     compile_module_static_declaration_prologue(&comp, &node->body->args);
+
+  if (node->body && node->body->type == N_BLOCK) {
+    sv_decl_names_t params;
+    decl_names_init(&params);
+    for (int i = 0; i < node->args.count; i++) collect_pattern_names(node->args.items[i], &params);
+    bool module_top = comp.mode == SV_COMPILE_MODULE && comp.enclosing && !comp.enclosing->enclosing;
+    check_statement_list_declarations(&comp, &node->body->args, module_top, &params, true);
+    decl_names_free(&params);
+  }
 
   if (node->body) {
     if (node->body->type == N_BLOCK)
@@ -7493,34 +7861,28 @@ sv_func_t *compile_function_body(
   emit_op(&comp, OP_RETURN_UNDEF);
 
   int max_locals = comp.max_local_count - comp.param_locals;
-  sv_func_t *func = code_arena_bump(sizeof(sv_func_t));
-  memset(func, 0, sizeof(sv_func_t));
-  func->debug = code_arena_bump(sizeof(sv_func_debug_t));
-  memset(func->debug, 0, sizeof(sv_func_debug_t));
+  sv_func_t *func = sv_func_new(comp.js);
 
   sv_func_init_code_and_map_templates(&comp, func);
   sv_func_init_obj_sites(&comp, func);
 
   if (comp.const_count > 0) {
-    func->constants = code_arena_bump((size_t)comp.const_count * sizeof(ant_value_t));
+    func->constants = sv_code_bump(comp.js, (size_t)comp.const_count * sizeof(ant_value_t));
     memcpy(func->constants, comp.constants, (size_t)comp.const_count * sizeof(ant_value_t));
     func->const_count = comp.const_count;
-    build_gc_const_tables(func);
+    if (!build_gc_const_tables(comp.js, func)) js_mkerr(comp.js, "out of memory building constant tables");
   }
 
   if (comp.atom_count > 0) {
-    func->atoms = code_arena_bump((size_t)comp.atom_count * sizeof(sv_atom_t));
+    func->atoms = sv_code_bump(comp.js, (size_t)comp.atom_count * sizeof(sv_atom_t));
     memcpy(func->atoms, comp.atoms, (size_t)comp.atom_count * sizeof(sv_atom_t));
     func->atom_count = comp.atom_count;
   }
   func->ic_count = (uint16_t)comp.ic_count;
-  if (func->ic_count > 0) {
-    func->ic_slots = code_arena_bump((size_t)func->ic_count * sizeof(sv_ic_entry_t));
-    memset(func->ic_slots, 0, (size_t)func->ic_count * sizeof(sv_ic_entry_t));
-  }
+  func->ic_slots = alloc_ic_slots(comp.js, func->ic_count);
 
   if (comp.upvalue_count > 0) {
-    func->upval_descs = code_arena_bump(
+    func->upval_descs = sv_code_bump(comp.js, 
       (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
     memcpy(func->upval_descs, comp.upval_descs,
       (size_t)comp.upvalue_count * sizeof(sv_upval_desc_t));
@@ -7528,7 +7890,7 @@ sv_func_t *compile_function_body(
   }
 
   if (comp.srcpos_count > 0) {
-    func->debug->srcpos = code_arena_bump((size_t)comp.srcpos_count * sizeof(sv_srcpos_t));
+    func->debug->srcpos = sv_code_bump(comp.js, (size_t)comp.srcpos_count * sizeof(sv_srcpos_t));
     memcpy(func->debug->srcpos, comp.srcpos, (size_t)comp.srcpos_count * sizeof(sv_srcpos_t));
     func->debug->srcpos_count = comp.srcpos_count;
   }
@@ -7561,12 +7923,12 @@ sv_func_t *compile_function_body(
   func->debug->source_line = (int)node->line;
   
   if (node->str && node->len > 0) {
-    char *name = code_arena_bump(node->len + 1);
+    char *name = sv_code_bump(comp.js, node->len + 1);
     memcpy(name, node->str, node->len);
     name[node->len] = '\0';
     func->debug->name = name;
   } else if (enclosing->inferred_name && enclosing->inferred_name_len > 0) {
-    char *name = code_arena_bump(enclosing->inferred_name_len + 1);
+    char *name = sv_code_bump(comp.js, enclosing->inferred_name_len + 1);
     memcpy(name, enclosing->inferred_name, enclosing->inferred_name_len);
     name[enclosing->inferred_name_len] = '\0';
     func->debug->name = name;
@@ -7921,7 +8283,10 @@ void sv_disasm(ant_t *js, sv_func_t *func, const char *label) {
   }}
 }
 
-sv_func_t *sv_compile(ant_t *js, sv_ast_t *program, sv_compile_mode_t mode, const char *source, ant_offset_t source_len) {
+sv_func_t *sv_compile(
+  ant_t *js, sv_ast_t *program, sv_compile_mode_t mode,
+  const char *source, ant_offset_t source_len, ant_value_t eval_env
+) {
   if (!program || program->type != N_PROGRAM) return NULL;
   if (mode != SV_COMPILE_EVAL_FUNCTION && ast_contains_lexical_new_target(program)) {
     js_mkerr_typed(js, JS_ERR_SYNTAX, "new.target is only valid in functions");
@@ -7934,9 +8299,10 @@ sv_func_t *sv_compile(ant_t *js, sv_ast_t *program, sv_compile_mode_t mode, cons
       if (ast_contains_direct_suspend(program->args.items[i], &offender)) break;
 
     if (offender) {
-      js_mkerr_typed(js, JS_ERR_SYNTAX, offender->type == N_AWAIT
-        ? "await is only valid in async functions and the top level bodies of modules"
-        : "yield is only valid in generator functions");
+      js_mkerr_typed(js, JS_ERR_SYNTAX,
+        offender->type == N_AWAIT ? "await is only valid in async functions and the top level bodies of modules" :
+        offender->type == N_FOR_AWAIT_OF ? "Unexpected reserved word" :
+        "yield is only valid in generator functions");
       return NULL;
     }
   }
@@ -7971,7 +8337,7 @@ sv_func_t *sv_compile(ant_t *js, sv_ast_t *program, sv_compile_mode_t mode, cons
   top_fn.len = (uint32_t)strlen(top_name);
   top_fn.src_off = 0;
   top_fn.src_end = (source_len > 0) ? (uint32_t)source_len : 0;
-  top_fn.body = sv_ast_new(N_BLOCK);
+  top_fn.body = sv_ast_new(js, N_BLOCK);
   top_fn.body->args = program->args;
   
   if (
@@ -7980,92 +8346,88 @@ sv_func_t *sv_compile(ant_t *js, sv_ast_t *program, sv_compile_mode_t mode, cons
     ast_contains_direct_eval(program))
   ) top_fn.flags |= FN_USES_NEW_TARGET;
 
+  sv_code_unit_t *unit = sv_compile_mode_is_eval(mode) ? sv_code_unit_begin(js) : NULL;
+  const char *text = copy_source_text(js, source, source_len);
+  
+  if (!text && source && source_len > 0) {
+    sv_code_unit_finish(unit);
+    sv_code_unit_unpin(unit);
+    return NULL;
+  }
+
   sv_compiler_t root;
   sv_compile_ctx_init_root(
-    &root, js, js->filename,
-    pin_source_text(source, source_len),
+    &root, js, js->filename, text,
     source_len, mode,
     (program->flags & FN_PARSE_STRICT) != 0,  NULL
   );
   
+  if (sv_compile_mode_is_eval(mode)) {
+    root.eval_shadows_undefined = sv_eval_env_shadows_global(js, eval_env, "undefined", 9);
+    root.eval_shadows_global_this = sv_eval_env_shadows_global(js, eval_env, "globalThis", 10);
+  }
+  
   root.line_table = sv_compile_ctx_build_line_table(root.source, source_len);
   sv_func_t *func = compile_function_body(&root, &top_fn, mode);
   sv_compile_ctx_free_line_table(root.line_table);
+  sv_code_unit_finish(unit);
   
   if (sv_compile_trace_unlikely) fprintf(
     stderr, "[compile] end kind=program mode=%d thrown=%d func=%p\n",
     (int)mode, Ant_Exception_Pending(js) ? 1 : 0, (void *)func
   );
   
-  if (Ant_Exception_Pending(js) || !func) return NULL;
+  if (Ant_Exception_Pending(js) || !func) {
+    sv_code_unit_unpin(unit);
+    return NULL;
+  }
   return func;
 }
 
-sv_func_t *sv_compile_function(ant_t *js, const char *source, size_t len, bool is_async, bool is_generator) {
+sv_func_t *sv_compile_function(ant_t *js, const sv_function_parts_t *parts) {
   if (sv_compile_trace_unlikely) fprintf(
     stderr, "[compile] start kind=function len=%u async=%d generator=%d\n",
-    (unsigned)len, is_async ? 1 : 0, is_generator ? 1 : 0
+    (unsigned)parts->len, parts->is_async ? 1 : 0, parts->is_generator ? 1 : 0
   );
-  
-  const char *prefix = is_async
-    ? (is_generator ? "(async function*" : "(async function")
-    : (is_generator ? "(function*" : "(function");
-    
-  size_t prefix_len = strlen(prefix);
-  size_t wrapped_len = prefix_len + len + 1;
 
-  char *wrapped = malloc(wrapped_len + 1);
-  if (!wrapped) return NULL;
-
-  memcpy(wrapped, prefix, prefix_len);
-  memcpy(wrapped + prefix_len, source, len);
-  wrapped[prefix_len + len] = ')';
-  wrapped[wrapped_len] = '\0';
-  
-  code_arena_mark_t parse_mark = parse_arena_mark();
-  sv_ast_t *program = sv_parse(js, wrapped, (ant_offset_t)wrapped_len, false);
-  
-  if (!program) {
-    parse_arena_rewind(parse_mark);
-    free(wrapped);
+  code_arena_mark_t parse_mark = parse_arena_mark(js);
+  sv_ast_t *func_node = sv_parse_function_parts(js, parts);
+  if (!func_node) {
+    parse_arena_rewind(js, parse_mark);
     return NULL;
   }
 
-  sv_ast_t *func_node = NULL;
-  if (program->args.count > 0) {
-    sv_ast_t *stmt = program->args.items[0];
-    if (stmt && stmt->type == N_FUNC)  func_node = stmt;
-    else if (stmt && stmt->left && stmt->left->type == N_FUNC) func_node = stmt->left;
-  }
-
-  if (!func_node) {
-    parse_arena_rewind(parse_mark);
-    free(wrapped);
+  sv_code_unit_t *unit = sv_code_unit_begin(js);
+  const char *text = copy_source_text(js, parts->text, parts->len);
+  
+  if (!text) {
+    sv_code_unit_finish(unit);
+    sv_code_unit_unpin(unit);
+    parse_arena_rewind(js, parse_mark);
     return NULL;
   }
 
   sv_compiler_t root;
-  sv_compile_ctx_init_root(
-    &root, js, js->filename,
-    pin_source_text(wrapped, (ant_offset_t)wrapped_len),
-    (ant_offset_t)wrapped_len, SV_COMPILE_SCRIPT,
-    (program->flags & FN_PARSE_STRICT) != 0, NULL
-  );
+  sv_compile_ctx_init_root(&root, js, js->filename, text, parts->len, SV_COMPILE_SCRIPT, false, NULL);
   
   root.allows_new_target = true;
-  root.line_table = sv_compile_ctx_build_line_table(root.source, (ant_offset_t)wrapped_len);
+  root.function_ctor_root = true;
+  root.line_table = sv_compile_ctx_build_line_table(root.source, parts->len);
   sv_func_t *func = compile_function_body(&root, func_node, SV_COMPILE_SCRIPT);
   
   sv_compile_ctx_free_line_table(root.line_table);
-  parse_arena_rewind(parse_mark);
-  free(wrapped);
+  sv_code_unit_finish(unit);
+  parse_arena_rewind(js, parse_mark);
 
   if (sv_compile_trace_unlikely) fprintf(
     stderr, "[compile] end kind=function thrown=%d func=%p\n",
     Ant_Exception_Pending(js) ? 1 : 0, (void *)func
   );
     
-  if (Ant_Exception_Pending(js) || !func) return NULL;
+  if (Ant_Exception_Pending(js) || !func) {
+    sv_code_unit_unpin(unit);
+    return NULL;
+  }
   return func;
 }
 
@@ -8088,17 +8450,17 @@ sv_func_t *sv_compile_function_with_params(
   }
 
   bool parse_strict = sv_vm_is_strict(js->vm);
-  code_arena_mark_t parse_mark = parse_arena_mark();
-  sv_ast_t *program = sv_parse(js, body, (ant_offset_t)body_len, parse_strict);
+  code_arena_mark_t parse_mark = parse_arena_mark(js);
+  sv_ast_t *program = sv_parse(js, body, (ant_offset_t)body_len, SV_PARSE_SCRIPT, parse_strict);
   
   if (!program) {
-    parse_arena_rewind(parse_mark);
+    parse_arena_rewind(js, parse_mark);
     return NULL;
   }
 
   if (program->flags & FN_MODULE_SYNTAX) {
     js_mkerr_typed(js, JS_ERR_SYNTAX, "Cannot use import/export syntax in CommonJS");
-    parse_arena_rewind(parse_mark);
+    parse_arena_rewind(js, parse_mark);
     return NULL;
   }
 
@@ -8124,9 +8486,9 @@ sv_func_t *sv_compile_function_with_params(
       name_len = params[i].len ? params[i].len : strlen(name);
     }
 
-    sv_ast_t *ident = sv_ast_new(N_IDENT);
+    sv_ast_t *ident = sv_ast_new(js, N_IDENT);
     if (!ident) {
-      parse_arena_rewind(parse_mark);
+      parse_arena_rewind(js, parse_mark);
       return NULL;
     }
 
@@ -8134,21 +8496,26 @@ sv_func_t *sv_compile_function_with_params(
     ident->len = (uint32_t)name_len;
     ident->line = 1;
     ident->col = 1;
-    sv_ast_list_push(&top_fn.args, ident);
+    sv_ast_list_push(js, &top_fn.args, ident);
   }
 
-  top_fn.body = sv_ast_new(N_BLOCK);
+  top_fn.body = sv_ast_new(js, N_BLOCK);
   if (!top_fn.body) {
-    parse_arena_rewind(parse_mark);
+    parse_arena_rewind(js, parse_mark);
     return NULL;
   }
   
   top_fn.body->args = program->args;
+  const char *text = copy_source_text(js, body, (ant_offset_t)body_len);
+  if (!text && body && body_len > 0) {
+    parse_arena_rewind(js, parse_mark);
+    return NULL;
+  }
+
   sv_compiler_t root;
   
   sv_compile_ctx_init_root(
-    &root, js, js->filename,
-    pin_source_text(body, (ant_offset_t)body_len),
+    &root, js, js->filename, text,
     (ant_offset_t)body_len, SV_COMPILE_SCRIPT,
     (program->flags & FN_PARSE_STRICT) != 0, NULL
   );
@@ -8158,7 +8525,7 @@ sv_func_t *sv_compile_function_with_params(
   sv_func_t *func = compile_function_body(&root, &top_fn, SV_COMPILE_SCRIPT);
   
   sv_compile_ctx_free_line_table(root.line_table);
-  parse_arena_rewind(parse_mark);
+  parse_arena_rewind(js, parse_mark);
   
   if (sv_compile_trace_unlikely) fprintf(
     stderr, "[compile] end kind=function-with-params thrown=%d func=%p\n",

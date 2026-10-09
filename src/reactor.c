@@ -12,9 +12,9 @@
 
 static inline work_flags_t get_pending_work(ant_t *js) {
   work_flags_t flags = 0;
-  if (has_pending_microtasks())         flags |= WORK_MICROTASKS;
-  if (has_pending_timers())             flags |= WORK_TIMERS;
-  if (has_pending_immediates())         flags |= WORK_IMMEDIATES;
+  if (has_pending_microtasks(js))       flags |= WORK_MICROTASKS;
+  if (has_pending_timers(js))           flags |= WORK_TIMERS;
+  if (has_pending_immediates(js))       flags |= WORK_IMMEDIATES;
   if (has_pending_fetches())            flags |= WORK_FETCHES;
   if (has_pending_fs_ops())             flags |= WORK_FS_OPS;
   if (has_pending_child_processes())    flags |= WORK_CHILD_PROCS;
@@ -31,6 +31,7 @@ static inline bool event_loop_alive(ant_t *js) {
 void js_poll_events(ant_t *js) {
   gc_maybe(js);
 
+  process_microtasks(js);
   process_immediates(js);
   process_microtasks(js);
 }
@@ -48,6 +49,18 @@ int ant_uv_run(uv_loop_t *loop, uv_run_mode mode) {
   return result;
 }
 
+static bool reactor_idle_gc(ant_t *js) {
+  if (!gc_idle_wanted(js)) return false;
+  
+  size_t marker = gc_alloc_marker(js);
+  ant_uv_run(uv_default_loop(), UV_RUN_NOWAIT);
+  
+  if (gc_alloc_marker(js) != marker || (get_pending_work(js) & WORK_BLOCKING)) return true;
+  gc_idle(js, uv_backend_timeout(uv_default_loop()));
+  
+  return false;
+}
+
 void js_run_event_loop(ant_t *js) {
 drain:
   while (event_loop_alive(js)) {
@@ -55,19 +68,20 @@ drain:
     js_poll_events(js);
     work_flags_t work = get_pending_work(js);
   
-    if (work & WORK_BLOCKING) 
+    if ((work & WORK_BLOCKING) || has_active_immediates(js))
       ant_uv_run(uv_default_loop(), UV_RUN_NOWAIT);
-    else if ((work & WORK_ASYNC) || uv_loop_alive(uv_default_loop()))
-      ant_uv_run(uv_default_loop(), UV_RUN_ONCE);
-    else break;
+    else if ((work & WORK_ASYNC) || uv_loop_alive(uv_default_loop())) {
+      if (!reactor_idle_gc(js)) ant_uv_run(uv_default_loop(), UV_RUN_ONCE);
+    } else break;
   
     process_report_uncaught_exception_if_pending(js);
   }
   
   process_report_uncaught_exception_if_pending(js);
-  js_poll_events(js);
-  ant_value_t code = js_mknum(0);
+  if (has_pending_immediates(js)) process_immediates(js);
+  process_microtasks(js);
   
+  ant_value_t code = js_mknum(process_exit_code(js));
   emit_process_event(js, "beforeExit", &code, 1);
   if (event_loop_alive(js)) goto drain;
 }

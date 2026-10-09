@@ -226,6 +226,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
       } else if (fb_num_only && l_is_num && r_is_num) {
         MIR_reg_t fd_r = c->vs.d_regs[c->vs.sp];
         MIR_reg_t fd_dst = c->vs.d_regs[c->vs.sp - 1];
@@ -325,6 +326,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
         MIR_append_insn(c->ctx, c->jit_func, done);
       }
       break;
@@ -361,6 +363,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
       } else if (fb_num_only && l_is_num && r_is_num) {
         MIR_reg_t fd_r = c->vs.d_regs[c->vs.sp];
         MIR_reg_t fd_dst = c->vs.d_regs[c->vs.sp - 1];
@@ -460,6 +463,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
         MIR_append_insn(c->ctx, c->jit_func, done);
       }
       break;
@@ -495,6 +499,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
       } else if (fb_num_only && l_is_num && r_is_num) {
         MIR_reg_t fd_r = c->vs.d_regs[c->vs.sp];
         MIR_reg_t fd_dst = c->vs.d_regs[c->vs.sp - 1];
@@ -594,6 +599,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
         MIR_append_insn(c->ctx, c->jit_func, done);
       }
       break;
@@ -626,6 +632,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
       } else if (fb_num_only) {
         MIR_label_t bail_direct = MIR_new_label(c->ctx);
         MIR_label_t skip_bail = MIR_new_label(c->ctx);
@@ -678,6 +685,7 @@ void jit_emit_arithmetic(jit_compile_t *c) {
         mir_emit_bailout_check_typed(c->ctx, c->jit_func, rd,
                                      c->r_bailout_val, c->bc_off, c->vs.sp + 1, &c->bailout_ctx,
                                      c->vs.sp - 1, l_is_num, c->vs.sp, r_is_num);
+        jit_emit_throw_if_error(c, rd);
         MIR_append_insn(c->ctx, c->jit_func, done);
       }
       break;
@@ -773,6 +781,21 @@ void jit_emit_arithmetic(jit_compile_t *c) {
     case OP_POST_INC:
     case OP_POST_DEC: {
       int old_idx = c->vs.sp - 1;
+      if (c->vs.slot_type[old_idx] == SLOT_I32) {
+        // the old value stays an integer, new one is a double, so no overflow check
+        MIR_reg_t rold = vstack_top(&c->vs);
+        vstack_push(&c->vs);
+        int new_idx = c->vs.sp - 1;
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_I2D,
+            MIR_new_reg_op(c->ctx, c->vs.d_regs[new_idx]), MIR_new_reg_op(c->ctx, rold)));
+        MIR_append_insn(c->ctx, c->jit_func,
+                        MIR_new_insn(c->ctx, c->op == OP_POST_INC ? MIR_DADD : MIR_DSUB,
+                                     MIR_new_reg_op(c->ctx, c->vs.d_regs[new_idx]),
+                                     MIR_new_reg_op(c->ctx, c->vs.d_regs[new_idx]),
+                                     MIR_new_reg_op(c->ctx, c->r_d_one)));
+        c->vs.slot_type[new_idx] = SLOT_NUM;
+        break;
+      }
       bool input_is_num = vstack_prepare_num(
           &c->vs, old_idx, c->ctx, c->jit_func, c->r_d_slot);
       MIR_reg_t rold = vstack_top(&c->vs);

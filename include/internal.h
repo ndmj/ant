@@ -8,6 +8,7 @@
 #include "isolate.h"
 
 #include "gc/strings.h"
+#include "gc/roots.h"
 #include "silver/ast.h"
 #include "descriptors.h"
 #include "esm/loader.h"
@@ -101,9 +102,25 @@ enum: ant_value_t {
 
 static inline void ant_prototype_write_epoch_bump(ant_t *js) {
   if (++js->prototype_write_epoch == 0) {
-    ant_ic_epoch_bump();
+    ant_ic_epoch_bump(js);
     js->prototype_write_epoch = 1;
   }
+}
+
+static inline bool ant_property_key_is_protector(ant_t *js, const char *key) {
+  return 
+    key == js->intern.promise     || 
+    key == js->intern.resolve     ||
+    key == js->intern.constructor || 
+    key == js->intern.then;
+}
+
+static inline bool ant_property_key_is_watched(ant_t *js, const char *key) {
+  return 
+    ant_property_key_is_protector(js, key) || 
+    key == js->intern.prototype ||
+    key == js->intern.exec      ||
+    key == js->intern.replace;
 }
 
 static inline void ant_property_mutation_invalidate(
@@ -130,13 +147,23 @@ static inline void ant_property_mutation_invalidate(
     return;
   }
 
+  if (key == js->intern.next) {
+    if (is_object_type(js->sym.array_iterator_proto) && holder == js_obj_ptr(js->sym.array_iterator_proto))
+      js->array_iteration_protector_invalid = true;
+    return;
+  }
+
   bool invalidates_constructor = key == js->intern.constructor;
   if (!invalidates_constructor && key != js->intern.then) return;
+  
+  if (
+    invalidates_constructor && 
+    (holder->type_tag == kTypeArray || (is_object_type(js->sym.array_proto) && holder == js_obj_ptr(js->sym.array_proto)))
+  ) js->array_species_protector_invalid = true;
 
-  ant_object_t *promise_proto = is_object_type(js->sym.promise_proto)
-    ? js_obj_ptr(js->sym.promise_proto) : NULL;
-
+  ant_object_t *promise_proto = is_object_type(js->sym.promise_proto) ? js_obj_ptr(js->sym.promise_proto) : NULL;
   if (!holder->promise_state && holder != promise_proto) return;
+  
   if (invalidates_constructor) {
     js->promise_constructor_protector_invalid = true;
     js->promise_species_protector_invalid = true;
@@ -207,8 +234,21 @@ static inline bool js_cfunc_same_entrypoint(ant_value_t fn_val, ant_cfunc_t fn) 
   return meta && meta->fn == fn;
 }
 
-ant_value_t extract_array_args(ant_t *js, ant_value_t arr, ant_value_t **out_args, int *out_count);
-ant_value_t js_proxy_has(ant_t *js, ant_value_t proxy, const char *key, size_t key_len);
+typedef struct {
+  gc_temp_root_scope_t roots;
+  ant_value_t *args;
+  int argc;
+} js_arg_list_t;
+
+typedef ant_value_t (*js_group_add_fn)(
+  ant_t *js,
+  void *ctx,
+  ant_value_t key,
+  ant_value_t value
+);
+
+ant_value_t js_arg_list_from(ant_t *js, ant_value_t array_like, js_arg_list_t *list);
+void js_arg_list_release(js_arg_list_t *list);
 
 size_t uint_to_str(char *buf, size_t bufsize, uint64_t val);
 size_t tostr(ant_t *js, ant_value_t value, char *buf, size_t len);
@@ -222,8 +262,9 @@ double js_parse_float_value(ant_t *js, ant_value_t arg);
 bool js_obj_ensure_prop_capacity(ant_object_t *obj, uint32_t needed);
 bool js_obj_ensure_unique_shape(ant_object_t *obj);
 
-ant_value_t js_template_to_string(ant_t *js, ant_value_t v);
+ant_value_t js_group_by(ant_t *js, ant_value_t items, ant_value_t callback, js_group_add_fn add, void *ctx);
 ant_value_t js_define_property(ant_t *js, ant_value_t obj, ant_value_t prop, ant_value_t descriptor, bool reflect_mode);
+ant_value_t js_proxy_has(ant_t *js, ant_value_t proxy, const char *key, size_t key_len);
 
 ant_value_t mkprop(ant_t *js, ant_value_t obj, ant_value_t k, ant_value_t v, uint8_t attrs);
 ant_value_t mkprop_exact_attrs(ant_t *js, ant_value_t obj, ant_value_t k, ant_value_t v, uint8_t attrs);
@@ -234,6 +275,8 @@ ant_value_t mkprop_append_fast(ant_t *js, ant_value_t obj, const char *key, size
 ant_value_t setprop_cstr(ant_t *js, ant_value_t obj, const char *key, size_t len, ant_value_t v);
 ant_value_t setprop_interned(ant_t *js, ant_value_t obj, const char *key, size_t len, ant_value_t v);
 
+ant_value_t js_template_to_string(ant_t *js, ant_value_t v);
+ant_value_t js_to_numeric(ant_t *js, ant_value_t arg);
 ant_value_t js_define_own_prop(ant_t *js, ant_value_t obj, const char *key, size_t klen, ant_value_t v);
 ant_value_t js_instance_proto_from_new_target(ant_t *js, ant_value_t fallback_proto, ant_value_t new_target);
 ant_value_t js_construct_native(ant_t *js, ant_cfunc_t ctor, ant_value_t *args, int nargs);
@@ -269,16 +312,26 @@ ant_prop_loc_t lkp_sym_proto(ant_t *js, ant_value_t obj, ant_offset_t sym_off);
 ant_value_t mkobj(ant_t *js, ant_offset_t parent);
 ant_value_t js_mkobj_with_inobj_limit(ant_t *js, uint8_t inobj_limit);
 ant_value_t js_mkarr_dense_literal(ant_t *js, const ant_value_t *elements, uint32_t count);
+ant_value_t js_mkarr_dense_uninit(ant_t *js, uint32_t count, ant_value_t **out_data);
 ant_value_t js_mkobj_from_template(ant_t *js, ant_value_t template);
 
 ant_value_t js_for_in_keys(ant_t *js, ant_value_t obj);
 ant_value_t js_own_property_keys(ant_t *js, ant_value_t obj, bool include_symbols, bool enumerable_only);
 ant_value_t js_delete_prop(ant_t *js, ant_value_t obj, const char *key, size_t len);
+ant_value_t js_delete_prop_ordinary(ant_t *js, ant_value_t obj, const char *key, size_t len);
 ant_value_t js_delete_sym_prop(ant_t *js, ant_value_t obj, ant_value_t sym);
 
 ant_value_t js_cfunc_promote(ant_t *js, ant_value_t cfunc);
 ant_value_t js_cfunc_expose_named(ant_t *js, ant_value_t cfunc, const char *name, size_t name_len);
 ant_value_t js_set_function_name(ant_t *js, ant_value_t fn, const char *name, size_t name_len);
+
+typedef enum {
+  JS_FUNC_SOURCE_COPY,
+  JS_FUNC_SOURCE_PINNED,
+  JS_FUNC_SOURCE_UNIT,
+} js_func_source_t;
+
+void js_set_func_source(ant_t *js, ant_value_t fn, const char *code, size_t len, js_func_source_t source);
 ant_value_t js_setprop_index(ant_t *js, ant_value_t obj, uint32_t idx, ant_value_t value);
 
 ant_value_t js_set_function_name_prefixed(
@@ -300,19 +353,9 @@ ant_value_t js_maybe_set_function_name_from_key(
 );
 
 sv_func_t *js_compile_parsed_bytecode(
-  ant_t *js, struct sv_ast *program,
-  const char *buf, size_t len, int mode
+  ant_t *js, struct sv_ast *program, const char *buf, 
+  size_t len, int mode, ant_value_t eval_env
 );
-
-bool is_proxy(ant_value_t obj);
-bool is_array_value(ant_value_t value);
-bool js_is_array_includes_builtin(ant_value_t func);
-bool js_is_function_apply_builtin(ant_value_t func);
-bool strict_eq_values(ant_t *js, ant_value_t l, ant_value_t r);
-bool same_value_values(ant_t *js, ant_value_t l, ant_value_t r);
-bool js_string_intrinsic_builtin_matches(ant_value_t func, ant_string_intrinsic_kind_t kind);
-bool js_deep_equal(ant_t *js, ant_value_t a, ant_value_t b, bool strict);
-bool js_is_prototype_of(ant_t *js, ant_value_t proto_obj, ant_value_t obj);
 
 bool js_try_char_code_at(
   ant_t *js, ant_value_t func, ant_value_t receiver,
@@ -325,11 +368,22 @@ ant_value_t js_eval_bytecode_eval_in_env_with_strict(
   ant_value_t new_target, bool allows_new_target
 );
 
+bool is_proxy(ant_value_t obj);
+bool is_array_value(ant_value_t value);
+bool js_is_array_includes_builtin(ant_value_t func);
+bool js_is_function_apply_builtin(ant_value_t func);
+bool strict_eq_values(ant_t *js, ant_value_t l, ant_value_t r);
+bool same_value_values(ant_t *js, ant_value_t l, ant_value_t r);
+bool js_string_intrinsic_builtin_matches(ant_value_t func, ant_string_intrinsic_kind_t kind);
+bool js_deep_equal(ant_t *js, ant_value_t a, ant_value_t b, bool strict);
+bool js_is_prototype_of(ant_t *js, ant_value_t proto_obj, ant_value_t obj);
+
 ant_value_t js_primitive_prototype(ant_t *js, uint8_t type);
 ant_value_t js_normalize_sloppy_this(ant_t *js, ant_value_t value);
 ant_value_t js_resolve_bound_target(ant_value_t value);
 ant_value_t js_resolve_bound_target_known_bound(ant_value_t value);
 ant_value_t js_execute_compiled_bytecode(ant_t *js, sv_func_t *func, coroutine_t **async_coro_out);
+ant_value_t js_execute_compiled_module(ant_t *js, sv_func_t *func);
 ant_value_t js_proxy_apply(ant_t *js, ant_value_t proxy, ant_value_t this_arg, ant_value_t *args, int argc);
 ant_value_t js_proxy_construct(ant_t *js, ant_value_t proxy, ant_value_t *args, int argc, ant_value_t new_target);
 ant_value_t sv_call_native(ant_t *js, ant_value_t func, ant_value_t this_val, ant_value_t *args, int nargs, ant_value_t new_target);
@@ -432,11 +486,6 @@ static inline ant_value_t js_module_eval_active_ctx(ant_t *js) {
   return ctx ? ctx->module_ctx : js_mkundef();
 }
 
-static inline ant_value_t js_module_eval_active_import_meta(ant_t *js) {
-  ant_value_t module_ctx = js_module_eval_active_ctx(js);
-  return is_object_type(module_ctx) ? js_get(js, module_ctx, "meta") : js_mkundef();
-}
-
 static inline const char *js_module_eval_active_filename(ant_t *js) {
   ant_value_t module_ctx = js_module_eval_active_ctx(js);
   if (is_object_type(module_ctx)) {
@@ -444,13 +493,6 @@ static inline const char *js_module_eval_active_filename(ant_t *js) {
     if (vtype(filename) == kTypeString) return js_getstr(js, filename, NULL);
   }
   return js->filename;
-}
-
-static inline ant_module_format_t js_module_eval_active_format(ant_t *js) {
-  ant_module_t *ctx = js->modules.module_stack;
-  if (ctx) return ctx->format;
-  ctx = js->active_async_coro ? js_active_tla_module_ctx(js) : NULL;
-  return ctx ? ctx->format : MODULE_EVAL_FORMAT_UNKNOWN;
 }
 
 static inline bool is_length_key(const char *key, size_t len) {

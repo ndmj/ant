@@ -9,6 +9,7 @@
 #include "silver/eval_env.h"
 
 typedef struct sv_eval_env_state {
+  sv_func_t *func;
   const sv_eval_scope_t *scope;
   uint32_t cell_count;
   ant_value_t arguments_obj;
@@ -49,6 +50,9 @@ static inline sv_upvalue_t *sv_eval_capture_upvalue(sv_vm_t *vm, ant_value_t *sl
   uv->location = slot;
   uv->next = *pp;
   *pp = uv;
+  
+  if (vm->fp >= 0 && vtype(vm->frames[vm->fp].arguments_obj) != kTypeUndefined)
+    js_arguments_link_upvalue(vm->js, &vm->frames[vm->fp], uv);
 
   return uv;
 }
@@ -81,6 +85,7 @@ static inline sv_eval_env_state_t *sv_eval_env_state_create(
   sv_eval_env_state_t *state = calloc(1, size);
   if (!state) return NULL;
 
+  state->func = frame->func;
   state->scope = scope;
   state->cell_count = scope->count;
   state->arguments_obj = frame->arguments_obj;
@@ -134,8 +139,7 @@ static inline bool sv_eval_binding_store(
   sv_upvalue_t *uv = state->cells[index];
   
   if (!uv) return false;
-  *uv->location = value;
-  gc_upvalue_write_barrier(js, uv, value);
+  sv_upvalue_store(js, uv, value);
   
   if (
     (binding->kind & SV_EVAL_BIND_KIND_MASK) == SV_EVAL_BIND_PARAM &&
@@ -433,7 +437,7 @@ static inline ant_value_t sv_global_declare(ant_t *js, sv_func_t *func) {
     sv_global_lexical_index_insert(js, js->global_lexical_count - 1);
   }
 
-  ant_ic_epoch_bump();
+  ant_ic_epoch_bump(js);
   return js_mkundef();
 }
 

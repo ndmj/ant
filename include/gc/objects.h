@@ -9,8 +9,30 @@
 #include "wasm_embed.h"
 #endif
 
+static constexpr int GC_ARRAY_STORAGE_CLASSES = 6;
 static constexpr uint8_t ANT_GC_DEAD = 0xFF;
-typedef void (*gc_extra_roots_fn)(ant_t *js);
+
+typedef struct {
+  ant_value_t *head[GC_ARRAY_STORAGE_CLASSES];
+  uint32_t count[GC_ARRAY_STORAGE_CLASSES];
+  uint32_t taken[GC_ARRAY_STORAGE_CLASSES];
+} gc_array_storage_cache_t;
+
+typedef struct gc_vm_seg {
+  struct gc_vm_seg *prev;
+  uintptr_t lo, hi;
+  uintptr_t fp;
+  uint32_t jit_depth;
+} gc_vm_seg_t;
+
+typedef struct gc_func_mark_profile {
+  bool enabled;
+  uint64_t collections;
+  uint64_t func_visits;
+  uint64_t child_edges;
+  uint64_t const_slots;
+  uint64_t time_ns;
+} gc_func_mark_profile_t;
 
 static inline uint64_t gc_now_ns(void) {
 #ifdef ANT_WASM_EMBED
@@ -22,13 +44,6 @@ static inline uint64_t gc_now_ns(void) {
 #endif
 }
 
-typedef struct gc_vm_seg {
-  struct gc_vm_seg *prev;
-  uintptr_t lo, hi;
-  uintptr_t fp;
-  uint32_t jit_depth;
-} gc_vm_seg_t;
-
 #if defined(__aarch64__)
 #define GC_VM_SEG_SAVED_REGS_BYTES 144u
 #elif defined(__x86_64__)
@@ -36,6 +51,32 @@ typedef struct gc_vm_seg {
 #else
 #define GC_VM_SEG_SAVED_REGS_BYTES 0u
 #endif
+
+static constexpr uint32_t GC_CARD_SHIFT = 7;
+static constexpr uint32_t GC_CARD_SLOTS = 1u << GC_CARD_SHIFT;
+static constexpr uint32_t GC_CARD_MIN_CAP = 1024;
+
+struct gc_card_table {
+  uint32_t ncards;
+  bool all_dirty;
+  uint64_t bits[];
+};
+
+static inline gc_card_table_t *gc_cards_of(const ant_object_t *arr) {
+  ant_object_sidecar_t *sidecar = ant_object_sidecar(arr);
+  return sidecar ? sidecar->gc_cards : NULL;
+}
+
+static inline bool gc_card_is_set(const gc_card_table_t *cards, uint32_t card) {
+  return (cards->bits[card / 64u] & (UINT64_C(1) << (card % 64u))) != 0;
+}
+
+static inline void gc_card_set(gc_card_table_t *cards, uint32_t card) {
+  cards->bits[card / 64u] |= UINT64_C(1) << (card % 64u);
+}
+
+void gc_remember_element(ant_t *js, ant_object_t *arr, uint32_t idx);
+void gc_cards_mark_all(ant_object_t *arr);
 
 static inline __attribute__((always_inline)) uintptr_t gc_native_sp(void) {
   uintptr_t sp;
@@ -49,20 +90,27 @@ static inline __attribute__((always_inline)) uintptr_t gc_native_sp(void) {
   return sp;
 }
 
-bool gc_obj_is_marked(const ant_object_t *obj);
+typedef void (*gc_extra_roots_fn)(ant_t *js);
 
-uint64_t gc_get_epoch(void);
+uint64_t gc_get_epoch(ant_t *js);
 uint64_t gc_objects_run(ant_t *js, gc_extra_roots_fn extra_roots);
+
+bool gc_obj_is_marked(ant_t *js, const ant_object_t *obj);
+ant_value_t *gc_array_storage_alloc(ant_t *js, uint32_t cap);
 
 void gc_mark_str(ant_t *js, ant_value_t v);
 void gc_mark_value(ant_t *js, ant_value_t v);
 void gc_mark_closure(ant_t *js, sv_closure_t *c);
 void gc_mark_coroutine(ant_t *js, coroutine_t *coro);
 void gc_mark_upvalue_cells(ant_t *js, sv_upvalue_t *const *cells, uint32_t count);
+void gc_mark_arguments_cells(ant_t *js, ant_value_t obj);
 void gc_mark_conservative_range(ant_t *js, const void *ptr, size_t size);
 
 void gc_objects_run_minor(ant_t *js);
 void gc_object_free(ant_t *js, ant_object_t *obj);
+void gc_array_storage_release(ant_t *js, ant_value_t *data, uint32_t cap);
+void gc_array_storage_trim(ant_t *js);
+void gc_array_storage_cache_destroy(ant_t *js);
 void gc_pin_existing_objects(ant_t *js);
 
 void gc_root_pending_promise(ant_t *js, ant_object_t *obj);

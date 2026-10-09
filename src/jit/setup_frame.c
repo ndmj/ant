@@ -9,18 +9,20 @@ static void jit_discard_setup_module(jit_compile_t *c) {
   MIR_remove_module(c->ctx, c->mod);
 }
 
-static bool jit_numeric_param_use(sv_func_t *func, uint8_t *ip, uint8_t *end) {
+bool jit_numeric_param_use(sv_func_t *func, uint8_t *ip, uint8_t *end) {
   if (ip >= end) return false;
   sv_op_t op = (sv_op_t)*ip;
+  bool other_operand = false;
   if (op == OP_CONST_I8 || op == OP_CONST || op == OP_CONST8 ||
       op == OP_GET_ARG || op == OP_GET_LOCAL || op == OP_GET_LOCAL8) {
     ip += sv_op_size[op];
     if (ip >= end) return false;
     op = (sv_op_t)*ip;
+    other_operand = true;
   }
   switch (op) {
     case OP_INC: case OP_DEC: case OP_POST_INC: case OP_POST_DEC:
-      return true;
+      return !other_operand;
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE:
     case OP_BAND: case OP_BOR: case OP_BXOR:
@@ -85,6 +87,146 @@ static void jit_emit_cold_entry_counter(jit_compile_t *c, const char *site) {
   MIR_append_insn(c->ctx, c->jit_func,
                   MIR_new_ret_insn(c->ctx, 1, MIR_new_reg_op(c->ctx, r_res)));
   MIR_append_insn(c->ctx, c->jit_func, body);
+}
+
+typedef struct {
+  uint32_t start, end;
+  bool handler;
+} jit_dnum_block_t;
+
+static int jit_dnum_local_access(sv_op_t op, const uint8_t *ip, int param_count, bool *writes) {
+  *writes = false;
+  switch (op) {
+    case OP_GET_LOCAL: case OP_GET_LOCAL_CHK: return sv_get_u16(ip + 1);
+    case OP_GET_LOCAL8: return sv_get_u8(ip + 1);
+    case OP_INC_LOCAL: case OP_DEC_LOCAL: case OP_ADD_LOCAL: return sv_get_u8(ip + 1);
+    case OP_GET_SLOT_RAW: case OP_CALL_CALL_SLOT: return (int)sv_get_u16(ip + 1) - param_count;
+    case OP_PUT_LOCAL: case OP_SET_LOCAL: case OP_PUT_LOCAL_CHK: *writes = true; return sv_get_u16(ip + 1);
+    case OP_PUT_LOCAL8: case OP_SET_LOCAL8: *writes = true; return sv_get_u8(ip + 1);
+    default: return -1;
+  }
+}
+
+static int jit_dnum_block_of(const jit_dnum_block_t *blocks, int count, uint32_t off) {
+  int lo = 0, hi = count - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    if (off < blocks[mid].start) hi = mid - 1;
+    else if (off >= blocks[mid].end) lo = mid + 1;
+    else return mid;
+  }
+  return -1;
+}
+
+static void jit_clear_maybe_unassigned_dnum(
+  sv_func_t *func, uint8_t *dnum, uint8_t *known_type, int n_locals, int param_count
+) {
+  int *cand = calloc((size_t)n_locals, sizeof(int));
+  int ncand = 0;
+  for (int i = 0; i < n_locals && cand; i++) cand[i] = (dnum[i] || known_type[i] == SV_TI_NUM) ? ncand++ : -1;
+  uint32_t len = (uint32_t)func->code_len;
+  uint8_t *leader = ncand ? calloc((size_t)len + 1, 1) : NULL;
+  if (!leader) { free(cand); return; }
+
+  leader[0] = 1;
+  for (uint32_t off = 0; off < len;) {
+    sv_op_t op = (sv_op_t)func->code[off];
+    int sz = sv_op_size[op];
+    if (sz == 0) break;
+    uint16_t flags = sv_op_flags[op];
+    int64_t target = -1;
+    if (flags & SV_OPF_JIT_BRANCH32) target = (int64_t)off + sz + sv_get_i32(func->code + off + 1);
+    else if (flags & SV_OPF_JIT_BRANCH8) target = (int64_t)off + sz + sv_get_i8(func->code + off + 1);
+    else if (op == OP_TRY_PUSH || op == OP_TRY_PUSH_FINALLY || op == OP_CATCH || op == OP_UNWIND_JMP)
+      target = (int64_t)off + 5 + sv_get_i32(func->code + off + 1);
+    if (target >= 0 && target <= len) leader[target] |= (op == OP_TRY_PUSH || op == OP_TRY_PUSH_FINALLY || op == OP_CATCH || op == OP_UNWIND_JMP) ? 3 : 1;
+    if (target >= 0 || (flags & SV_OPF_TERMINAL)) leader[off + sz < len ? off + sz : len] |= 1;
+    off += (uint32_t)sz;
+  }
+
+  int nblocks = 0;
+  for (uint32_t off = 0; off < len; off++) if (leader[off]) nblocks++;
+  int words = (ncand + 63) / 64;
+  jit_dnum_block_t *blocks = calloc((size_t)nblocks, sizeof(*blocks));
+  uint64_t *in = calloc((size_t)nblocks * (size_t)words, sizeof(uint64_t));
+  uint64_t *state = calloc((size_t)words, sizeof(uint64_t));
+  bool *queued = calloc((size_t)nblocks, sizeof(bool));
+  bool *seen = calloc((size_t)nblocks, sizeof(bool));
+  int *work = calloc((size_t)nblocks + 1, sizeof(int));
+  bool *bad = calloc((size_t)ncand, sizeof(bool));
+  if (!blocks || !in || !state || !queued || !seen || !work || !bad) goto done;
+
+  for (uint32_t off = 0, b = 0; off < len; off++) {
+    if (!leader[off]) continue;
+    if (b > 0) blocks[b - 1].end = off;
+    blocks[b] = (jit_dnum_block_t){ .start = off, .end = len, .handler = (leader[off] & 2) != 0 };
+    b++;
+  }
+
+  int wn = 0;
+  for (int b = 0; b < nblocks; b++) if (b == 0 || blocks[b].handler) {
+    memset(in + (size_t)b * words, 0xff, (size_t)words * sizeof(uint64_t));
+    work[wn++] = b; queued[b] = seen[b] = true;
+  }
+
+  for (int pass = 0; pass < 2; pass++) {
+    while (wn > 0) {
+      int b = work[--wn];
+      queued[b] = false;
+      memcpy(state, in + (size_t)b * words, (size_t)words * sizeof(uint64_t));
+      bool falls = true;
+      int64_t target = -1;
+      for (uint32_t off = blocks[b].start; off < blocks[b].end;) {
+        sv_op_t op = (sv_op_t)func->code[off];
+        int sz = sv_op_size[op];
+        if (sz == 0) { falls = false; break; }
+        bool writes = false;
+        int local = jit_dnum_local_access(op, func->code + off, param_count, &writes);
+        if (local >= 0 && local < n_locals && cand[local] >= 0) {
+          int ci = cand[local];
+          uint64_t bit = 1ull << (ci & 63);
+          if (!writes && (state[ci >> 6] & bit)) bad[ci] = true;
+          if (op == OP_INC_LOCAL || op == OP_DEC_LOCAL || op == OP_ADD_LOCAL || writes) state[ci >> 6] &= ~bit;
+        }
+        if (op == OP_SET_LOCAL_UNDEF) {
+          uint16_t li = sv_get_u16(func->code + off + 1);
+          if (li < n_locals && cand[li] >= 0) state[cand[li] >> 6] |= 1ull << (cand[li] & 63);
+        }
+        uint16_t flags = sv_op_flags[op];
+        if (flags & SV_OPF_JIT_BRANCH32) target = (int64_t)off + sz + sv_get_i32(func->code + off + 1);
+        else if (flags & SV_OPF_JIT_BRANCH8) target = (int64_t)off + sz + sv_get_i8(func->code + off + 1);
+        if (flags & SV_OPF_TERMINAL) falls = false;
+        off += (uint32_t)sz;
+      }
+      int succ[2] = { falls && b + 1 < nblocks ? b + 1 : -1, target >= 0 ? jit_dnum_block_of(blocks, nblocks, (uint32_t)target) : -1 };
+      for (int k = 0; k < 2; k++) {
+        int sb = succ[k];
+        if (sb < 0) continue;
+        uint64_t *dst = in + (size_t)sb * words;
+        bool changed = !seen[sb];
+        for (int w = 0; w < words; w++) {
+          uint64_t merged = dst[w] | state[w];
+          if (merged != dst[w]) { dst[w] = merged; changed = true; }
+        }
+        seen[sb] = true;
+        if (changed && !queued[sb]) { queued[sb] = true; work[wn++] = sb; }
+      }
+    }
+    for (int b = 0; b < nblocks && pass == 0; b++) if (!seen[b]) {
+      memset(in + (size_t)b * words, 0xff, (size_t)words * sizeof(uint64_t));
+      seen[b] = queued[b] = true;
+      work[wn++] = b;
+    }
+  }
+
+  for (int i = 0; i < n_locals; i++) if (cand[i] >= 0 && bad[cand[i]]) {
+    dnum[i] = 0;
+    known_type[i] = SV_TI_UNKNOWN;
+  }
+
+done:
+  free(cand); free(leader); free(blocks); free(in); free(state);
+  free(queued); free(seen); free(work); free(bad);
 }
 
 bool jit_setup_frame(jit_compile_t *c) {
@@ -182,9 +324,10 @@ bool jit_setup_frame(jit_compile_t *c) {
   c->vs.known_const = calloc((size_t)c->vs.max, sizeof(uint64_t));
   c->vs.has_const = calloc((size_t)c->vs.max, sizeof(bool));
   c->vs.known_bool = calloc((size_t)c->vs.max, sizeof(uint8_t));
+  c->vs.known_builtin = calloc((size_t)c->vs.max, sizeof(uint8_t));
   c->vs.integer_range = calloc((size_t)c->vs.max, sizeof(jit_integer_range_t));
 
-  if (!c->vs.regs || !c->vs.known_func || !c->vs.d_regs || !c->vs.slot_type || !c->vs.known_const || !c->vs.has_const || !c->vs.known_bool || !c->vs.integer_range) {
+  if (!c->vs.regs || !c->vs.known_func || !c->vs.d_regs || !c->vs.slot_type || !c->vs.known_const || !c->vs.has_const || !c->vs.known_bool || !c->vs.known_builtin || !c->vs.integer_range) {
     free(c->vs.regs);
     free(c->vs.known_func);
     free(c->vs.d_regs);
@@ -192,6 +335,7 @@ bool jit_setup_frame(jit_compile_t *c) {
     free(c->vs.known_const);
     free(c->vs.has_const);
     free(c->vs.known_bool);
+    free(c->vs.known_builtin);
     free(c->vs.integer_range);
 
     jit_discard_setup_module(c);
@@ -230,6 +374,7 @@ bool jit_setup_frame(jit_compile_t *c) {
       free(c->vs.known_const);
       free(c->vs.has_const);
       free(c->vs.known_bool);
+      free(c->vs.known_builtin);
       free(c->vs.integer_range);
       free(c->local_regs);
       free(c->local_d_regs);
@@ -315,6 +460,7 @@ bool jit_setup_frame(jit_compile_t *c) {
   c->inline_ext = (jit_inline_ext_t){
       .next_inline_id = &c->call_n,
       .helper1_proto = c->helper1_proto,
+      .get_length_proto = c->get_length_proto,
       .object_proto = c->object_proto,
       .imp_object = c->imp_object,
       .truthy_proto = c->truthy_proto,
@@ -333,6 +479,9 @@ bool jit_setup_frame(jit_compile_t *c) {
       .imp_call = c->imp_call,
       .call_method_proto = c->call_method_proto,
       .imp_call_method = c->imp_call_method,
+      .cfunc_proto = c->cfunc_proto,
+      .native_finish_proto = c->native_finish_proto,
+      .imp_native_finish = c->imp_native_finish,
       .stable_load_proto = c->stable_load_proto,
       .imp_load_stable_builtin = c->imp_load_stable_builtin,
       .stable_call_proto = c->stable_call_proto,
@@ -344,6 +493,9 @@ bool jit_setup_frame(jit_compile_t *c) {
       .imp_shr = c->imp_shr,
       .imp_ushr = c->imp_ushr,
       .self_proto = c->self_proto,
+      .math1_proto = c->math1_proto,
+      .math2_proto = c->math2_proto,
+      .imp_math = c->imp_math,
       .r_args_buf = c->r_args_buf,
   };
 
@@ -396,7 +548,7 @@ bool jit_setup_frame(jit_compile_t *c) {
     MIR_append_insn(c->ctx, c->jit_func,
                     MIR_new_insn(c->ctx, MIR_MOV,
                                  MIR_new_reg_op(c->ctx, c->r_ic_epoch_val),
-                                 MIR_new_uint_op(c->ctx, (uint64_t)(uintptr_t)&ant_ic_epoch_counter)));
+                                 MIR_new_uint_op(c->ctx, (uint64_t)(uintptr_t)&c->js->ic.epoch)));
   }
 
   c->r_bailout_val = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_JSVAL, "bail_val");
@@ -461,6 +613,7 @@ bool jit_setup_frame(jit_compile_t *c) {
       }
     }
   }
+  if (c->dnum_locals) jit_clear_maybe_unassigned_dnum(c->func, c->dnum_locals, c->known_type_locals, c->n_locals, c->param_count);
   c->entry_integer_ranges = calloc((size_t)c->n_locals, sizeof(jit_integer_range_t));
   c->entry_integer_regs = calloc((size_t)c->n_locals, sizeof(MIR_reg_t));
   if (c->entry_integer_ranges && c->entry_integer_regs && c->dnum_locals) {
@@ -471,6 +624,16 @@ bool jit_setup_frame(jit_compile_t *c) {
       char name[48];
       snprintf(name, sizeof(name), "entry_integer_%d", i);
       c->entry_integer_regs[i] = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, name);
+    }
+  }
+  c->induction_locals = NULL;
+  if (c->dnum_locals && !c->func->has_dynamic_eval) {
+    c->induction_locals = calloc((size_t)c->n_locals, 1);
+    if (c->induction_locals) {
+      jit_induction_locals(c->func, c->induction_locals, c->n_locals, c->param_count);
+      for (int i = 0; i < c->n_locals; i++)
+        if (!c->dnum_locals[i] || (c->entry_integer_regs && c->entry_integer_regs[i]))
+          c->induction_locals[i] = 0;
     }
   }
   c->params_in_slotbuf = c->writes_params || c->has_captured_params;
@@ -540,6 +703,15 @@ bool jit_setup_frame(jit_compile_t *c) {
                                  MIR_new_uint_op(c->ctx, (uint64_t)c->n_locals * sizeof(ant_value_t))));
   } else {
     mir_load_imm(c->ctx, c->jit_func, c->r_lbuf, 0);
+  }
+  if (c->has_captures && c->captured_locals && c->n_locals > 0) {
+    for (int i = 0; i < c->n_locals; i++)
+      if (c->captured_locals[i])
+        MIR_append_insn(c->ctx, c->jit_func,
+                        MIR_new_insn(c->ctx, MIR_MOV,
+                                     MIR_new_mem_op(c->ctx, MIR_T_I64,
+                                                    (MIR_disp_t)(i * (int)sizeof(ant_value_t)), c->r_lbuf, 0, 1),
+                                     MIR_new_uint_op(c->ctx, mkval(kTypeUndefined, 0))));
   }
 
   c->use_jit_upvalue_list = c->has_captured_slots;
@@ -644,6 +816,10 @@ bool jit_setup_frame(jit_compile_t *c) {
   scan_osr_entries(c->func, &c->osr_map);
   memset(c->param_cache, 0, sizeof(c->param_cache));
   memset(c->param_d_cache, 0, sizeof(c->param_d_cache));
+  memset(c->param_num, 0, sizeof(c->param_num));
+  memset(c->param_num_ok, 0, sizeof(c->param_num_ok));
+  memset(c->param_shadow, 0, sizeof(c->param_shadow));
+  c->induction_params = 0;
   {
     uint8_t read_mask = 0, written_mask = 0, numeric_mask = 0;
     uint8_t *pscan = c->func->code, *pend = c->func->code + c->func->code_len;
@@ -708,10 +884,27 @@ bool jit_setup_frame(jit_compile_t *c) {
                                                   (MIR_disp_t)(i * (int)sizeof(ant_value_t)), c->r_args, 0, 1)));
       MIR_append_insn(c->ctx, c->jit_func, done);
     }
+    if (!c->writes_params && c->needs_bailout) {
+      for (int i = 0; i < c->param_count && i < JIT_PARAM_HOIST_CAP; i++) {
+        if (!c->param_cache[i] || !(numeric_mask & (1u << i))) continue;
+        char name[24];
+        snprintf(name, sizeof(name), "parg_num%d", i);
+        c->param_num[i] = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_D, name);
+        snprintf(name, sizeof(name), "parg_num_ok%d", i);
+        c->param_num_ok[i] = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, name);
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_ULE,
+            MIR_new_reg_op(c->ctx, c->param_num_ok[i]), MIR_new_reg_op(c->ctx, c->param_cache[i]),
+            MIR_new_uint_op(c->ctx, NANBOX_PREFIX)));
+        mir_i64_to_d(c->ctx, c->jit_func, c->param_num[i], c->param_cache[i], c->r_d_slot);
+      }
+    }
     if (c->writes_params && !c->cold_tier && !c->feat.needs_tco_args) {
       MIR_label_t bad_type = MIR_new_label(c->ctx);
+      MIR_label_t not_integer = MIR_new_label(c->ctx);
+      MIR_label_t not_integer_at[JIT_PARAM_HOIST_CAP] = {0};
       MIR_label_t ready = MIR_new_label(c->ctx);
       bool any_numeric = false;
+      uint8_t counters = jit_induction_params(c->func, c->param_count);
       for (int i = 0; i < c->param_count && i < JIT_PARAM_HOIST_CAP; i++) {
         if (!c->param_cache[i] || !(numeric_mask & (1u << i))) continue;
         char name[24];
@@ -720,9 +913,45 @@ bool jit_setup_frame(jit_compile_t *c) {
         mir_emit_is_num_guard(c->ctx, c->jit_func, c->r_bool, c->param_cache[i], bad_type);
         mir_i64_to_d(c->ctx, c->jit_func, c->param_d_cache[i], c->param_cache[i], c->r_d_slot);
         any_numeric = true;
+        if (!(counters & (1u << i))) continue;
+        c->induction_params |= (uint8_t)(1u << i);
+        snprintf(name, sizeof(name), "parg_int%d", i);
+        MIR_reg_t integer = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, name);
+        snprintf(name, sizeof(name), "parg_back%d", i);
+        MIR_reg_t back = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_D, name);
+        snprintf(name, sizeof(name), "parg_top%d", i);
+        MIR_reg_t top = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, name);
+        not_integer_at[i] = MIR_new_label(c->ctx);
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_D2I,
+            MIR_new_reg_op(c->ctx, integer), MIR_new_reg_op(c->ctx, c->param_d_cache[i])));
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_I2D,
+            MIR_new_reg_op(c->ctx, back), MIR_new_reg_op(c->ctx, integer)));
+        // D2I saturates, so ±2^63 round-trip as INT64_MAX/MIN; doubling without overflow bounds the counter to ±2^62
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_ADDO,
+            MIR_new_reg_op(c->ctx, top), MIR_new_reg_op(c->ctx, integer), MIR_new_reg_op(c->ctx, integer)));
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_BO,
+            MIR_new_label_op(c->ctx, not_integer_at[i])));
+        MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_DBNE,
+            MIR_new_label_op(c->ctx, not_integer_at[i]),
+            MIR_new_reg_op(c->ctx, c->param_d_cache[i]), MIR_new_reg_op(c->ctx, back)));
       }
       if (any_numeric) {
         MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_JMP, MIR_new_label_op(c->ctx, ready)));
+        if (c->induction_params) {
+          MIR_reg_t failed = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, "parg_not_integer");
+          for (int i = 0; i < JIT_PARAM_HOIST_CAP; i++) {
+            if (!not_integer_at[i]) continue;
+            MIR_append_insn(c->ctx, c->jit_func, not_integer_at[i]);
+            mir_load_imm(c->ctx, c->jit_func, failed, 1u << i);
+            MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_JMP, MIR_new_label_op(c->ctx, not_integer)));
+          }
+          MIR_append_insn(c->ctx, c->jit_func, not_integer);
+          MIR_append_insn(c->ctx, c->jit_func, MIR_new_call_insn(c->ctx, 4,
+              MIR_new_ref_op(c->ctx, c->param_counters_off_proto),
+              MIR_new_ref_op(c->ctx, c->imp_param_counters_off),
+              MIR_new_uint_op(c->ctx, (uint64_t)(uintptr_t)c->func),
+              MIR_new_reg_op(c->ctx, failed)));
+        }
         MIR_append_insn(c->ctx, c->jit_func, bad_type);
         MIR_label_t call_entry = MIR_new_label(c->ctx);
         MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_MOV,
@@ -731,12 +960,9 @@ bool jit_setup_frame(jit_compile_t *c) {
                 offsetof(sv_vm_t, jit_osr) + offsetof(sv_jit_osr_t, active), c->r_vm, 0, 1)));
         MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_BEQ,
             MIR_new_label_op(c->ctx, call_entry), MIR_new_reg_op(c->ctx, c->r_bool), MIR_new_int_op(c->ctx, 0)));
-        // The OSR caller still owns the interpreter frame at its loop offset.
         MIR_append_insn(c->ctx, c->jit_func, MIR_new_ret_insn(c->ctx, 1,
             MIR_new_uint_op(c->ctx, SV_JIT_BAILOUT)));
         MIR_append_insn(c->ctx, c->jit_func, call_entry);
-        // A direct JIT caller expects a JS result, not an internal retry tag.
-        // No bytecode ran yet, so reconstruct from the original call inputs.
         MIR_reg_t entry_result = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_JSVAL, "param_entry_result");
         MIR_append_insn(c->ctx, c->jit_func, MIR_new_call_insn(c->ctx, 17,
             MIR_new_ref_op(c->ctx, c->resume_proto), MIR_new_ref_op(c->ctx, c->imp_resume),
@@ -753,16 +979,11 @@ bool jit_setup_frame(jit_compile_t *c) {
     }
   }
 
-  // The root allocation must not be repeated by a self-tail entry jump.
   if (c->ctx == c->jc->ctx_hot && !c->feat.needs_tco_args)
     c->hoisted_upvalue = jit_hot_loop_upvalue(c->func);
   if (c->hoisted_upvalue >= 0) {
-    // Closure initialization fixes the upvalue table and its cell pointers.
-    // Closing/rebinding a frame can still change cell->location and *location.
     MIR_reg_t table = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, "hoisted_upvalue_table");
     c->hoisted_upvalue_cell = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, "hoisted_upvalue_cell");
-    // Keep the owner alive using the same native-stack root convention as
-    // normalized this. A raw closure pointer is recognized by gc_scan_range.
     MIR_reg_t root = MIR_new_func_reg(c->ctx, c->jit_func->u.func, MIR_T_I64, "hoisted_closure_root");
     MIR_append_insn(c->ctx, c->jit_func, MIR_new_insn(c->ctx, MIR_ALLOCA,
         MIR_new_reg_op(c->ctx, root), MIR_new_int_op(c->ctx, sizeof(uint64_t))));

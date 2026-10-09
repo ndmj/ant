@@ -6,10 +6,8 @@
 #include "ptr.h"
 #include "errors.h"
 #include "internal.h"
-#include "silver/engine.h"
 #include "descriptors.h"
 
-#include "modules/symbol.h"
 #include "modules/buffer.h"
 #include "streams/brotli.h"
 #include "streams/compression.h"
@@ -53,34 +51,6 @@ static int parse_format(ant_t *js, ant_value_t arg, zformat_t *out) {
 
 static ant_value_t get_ts(ant_value_t obj) {
   return js_get_slot(obj, SLOT_ENTRIES);
-}
-
-bool cs_is_stream(ant_value_t obj) {
-  return is_object_type(obj)
-    && (js_check_native_tag(obj, CS_Z_NATIVE_TAG) || js_check_native_tag(obj, CS_BROTLI_NATIVE_TAG))
-    && ts_is_stream(get_ts(obj));
-}
-
-bool ds_is_stream(ant_value_t obj) {
-  return is_object_type(obj)
-    && (js_check_native_tag(obj, DS_Z_NATIVE_TAG) || js_check_native_tag(obj, DS_BROTLI_NATIVE_TAG))
-    && ts_is_stream(get_ts(obj));
-}
-
-ant_value_t cs_stream_readable(ant_value_t obj) {
-  return ts_stream_readable(get_ts(obj));
-}
-
-ant_value_t cs_stream_writable(ant_value_t obj) {
-  return ts_stream_writable(get_ts(obj));
-}
-
-ant_value_t ds_stream_readable(ant_value_t obj) {
-  return ts_stream_readable(get_ts(obj));
-}
-
-ant_value_t ds_stream_writable(ant_value_t obj) {
-  return ts_stream_writable(get_ts(obj));
 }
 
 static void zstate_finalize(ant_t *js, ant_object_t *obj) {
@@ -396,7 +366,7 @@ void init_compression_stream_module(ant_t *js) {
   js->builtins.cs_proto = js_mkobj(js);
   js_set_getter_desc(js, js->builtins.cs_proto, "readable", 8, js_mkfun(js_cs_get_readable), JS_DESC_C);
   js_set_getter_desc(js, js->builtins.cs_proto, "writable", 8, js_mkfun(js_cs_get_writable), JS_DESC_C);
-  js_set_sym(js, js->builtins.cs_proto, get_toStringTag_sym(), js_mkstr(js, "CompressionStream", 17));
+  js_set_sym(js, js->builtins.cs_proto, js->sym.toStringTag_sym, js_mkstr(js, "CompressionStream", 17));
 
   ant_value_t cs_ctor = js_make_ctor(js, js_cs_ctor, js->builtins.cs_proto, "CompressionStream", 17);
   js_set(js, g, "CompressionStream", cs_ctor);
@@ -405,7 +375,7 @@ void init_compression_stream_module(ant_t *js) {
   js->builtins.ds_proto = js_mkobj(js);
   js_set_getter_desc(js, js->builtins.ds_proto, "readable", 8, js_mkfun(js_ds_get_readable), JS_DESC_C);
   js_set_getter_desc(js, js->builtins.ds_proto, "writable", 8, js_mkfun(js_ds_get_writable), JS_DESC_C);
-  js_set_sym(js, js->builtins.ds_proto, get_toStringTag_sym(), js_mkstr(js, "DecompressionStream", 19));
+  js_set_sym(js, js->builtins.ds_proto, js->sym.toStringTag_sym, js_mkstr(js, "DecompressionStream", 19));
 
   ant_value_t ds_ctor = js_make_ctor(js, js_ds_ctor, js->builtins.ds_proto, "DecompressionStream", 19);
   js_set(js, g, "DecompressionStream", ds_ctor);

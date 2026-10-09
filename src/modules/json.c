@@ -13,7 +13,6 @@
 
 #include "silver/call.h"
 #include "modules/json.h"
-#include "modules/symbol.h"
 
 static inline bool json_value_needs_temp_root(ant_value_t value) {
   if (!is_tagged(value)) return false;
@@ -334,8 +333,8 @@ static bool json_prepare_object(
     if (found >= 0) slot = (uint32_t)found;
     else {
       bool added = bulk
-        ? ant_shape_add_interned(obj->shape, interned, ANT_PROP_ATTR_DEFAULT, &slot)
-        : ant_shape_add_interned_tr(&obj->shape, interned, ANT_PROP_ATTR_DEFAULT, &slot);
+        ? ant_shape_add_interned(js, obj->shape, interned, ANT_PROP_ATTR_DEFAULT, &slot)
+        : ant_shape_add_interned_tr(js, &obj->shape, interned, ANT_PROP_ATTR_DEFAULT, &slot);
       if (!added) return false;
     }
     if (slot != idx) *duplicates = true;
@@ -719,13 +718,13 @@ static ant_value_t json_apply_tojson(
       ant_value_t proto = js_get_proto(js, val);
       bool known_absent =
         ctx->tojson_proto == proto &&
-        ctx->tojson_epoch == ant_ic_epoch_counter &&
+        ctx->tojson_epoch == js->ic.epoch &&
         ctx->tojson_absent;
 
       if (!known_absent && is_object_type(proto)) {
         found = lkp_proto(js, proto, "toJSON", 6);
         ctx->tojson_proto = proto;
-        ctx->tojson_epoch = ant_ic_epoch_counter;
+        ctx->tojson_epoch = js->ic.epoch;
         ctx->tojson_absent = !found.obj;
       }
     }
@@ -1428,6 +1427,6 @@ void init_json_module(ant_t *js) {
   js_set(js, json_obj, "parse", js_mkfun(js_json_parse));
   js_set(js, json_obj, "stringify", js_mkfun(js_json_stringify));
   
-  js_set_sym(js, json_obj, get_toStringTag_sym(), js_mkstr(js, "JSON", 4));
+  js_set_sym(js, json_obj, js->sym.toStringTag_sym, js_mkstr(js, "JSON", 4));
   js_set_global_builtin(js, "JSON", json_obj);
 }

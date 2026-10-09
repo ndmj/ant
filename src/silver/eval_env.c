@@ -18,6 +18,7 @@ void sv_eval_env_gc_mark(ant_t *js, ant_object_t *obj) {
   sv_eval_env_state_t *state = sv_eval_env_state(js_obj_from_ptr(obj));
   if (!state) return;
   
+  if (state->func) gc_mark_value(js, mkref(kTypeFunctionInfo, state->func));
   gc_mark_value(js, state->arguments_obj);
   gc_mark_upvalue_cells(js, state->cells, state->cell_count);
 }
@@ -45,3 +46,13 @@ bool sv_global_lexical_lookup(
   return true;
 }
 
+bool sv_eval_env_shadows_global(ant_t *js, ant_value_t env, const char *name, uint32_t len) {
+  const char *interned = intern_string(name, len);
+  
+  for (ant_value_t cur = env; is_object_type(cur) && cur != js->global; cur = js_get_proto(js, cur)) {
+    if (sv_eval_env_find_binding(sv_eval_env_state(cur), name, len)) return true;
+    if (interned && lkp_interned(cur, interned).obj) return true;
+  }
+  
+  return false;
+}

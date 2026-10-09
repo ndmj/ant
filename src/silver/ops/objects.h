@@ -7,7 +7,6 @@
 #include "gc/roots.h"
 
 #include "silver/call.h"
-#include "modules/symbol.h"
 
 static inline void sv_define_method(
   ant_t *js, sv_func_t *func, uint8_t *ip,
@@ -219,12 +218,10 @@ static inline ant_value_t sv_op_spread(sv_vm_t *vm, ant_t *js) {
     return js_mkerr(js, "spread target is not an array");
   }
 
-  if (vtype(iterable) == kTypeArray) {
-    ant_offset_t len = js_arr_len(js, iterable);
-    for (ant_offset_t i = 0; i < len; i++)
-      js_arr_push(js, arr, js_arr_get(js, iterable, i));
+  if (vtype(iterable) == kTypeArray && js_array_iteration_default(js, iterable)) {
+    ant_value_t spread = js_arr_spread_into(js, arr, iterable);
     vm->sp--;
-    return tov(0);
+    return is_err(spread) ? spread : tov(0);
   }
 
   if (vtype(iterable) == kTypeString) {
@@ -250,7 +247,7 @@ static inline ant_value_t sv_op_spread(sv_vm_t *vm, ant_t *js) {
     return tov(0);
   }
 
-  ant_value_t iter_fn = js_get_sym(js, iterable, get_iterator_sym());
+  ant_value_t iter_fn = js_get_sym(js, iterable, js->sym.iterator_sym);
   uint8_t ft = vtype(iter_fn);
   if (ft != kTypeFunction && ft != kTypeBuiltin) {
     vm->sp--;
@@ -389,12 +386,10 @@ static inline ant_value_t sv_op_define_class(
   ) {
     size_t source_len = (size_t)(source_end - source_start);
     const char *source = func->debug->source + source_start;
-
-    if (!ant_cage_contains(source)) source = code_arena_alloc(source, source_len);
-    if (source && ant_cage_contains(source)) {
-      js_set_slot(ctor, SLOT_CODE, mkref(kTypeSourceCode, source));
-      js_set_slot(ctor, SLOT_CODE_LEN, tov((double)source_len));
-    }
+    js_set_func_source(
+      js, ctor, source, source_len, 
+      func->unit ? JS_FUNC_SOURCE_UNIT : JS_FUNC_SOURCE_PINNED
+    );
   }
   
   setprop_interned(js, proto, "constructor", 11, ctor);

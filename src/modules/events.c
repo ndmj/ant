@@ -16,7 +16,6 @@
 #include "gc/modules.h"
 #include "modules/abort.h"
 #include "modules/events.h"
-#include "modules/symbol.h"
 
 typedef struct {
   bool canceled;
@@ -276,6 +275,11 @@ static void evt_release_if_empty(EventType *evt) {
   EventTypeList *list = evt->owner;
 
   if (!list || evt->emitting != 0 || utarray_len(evt->listeners) != 0) return;
+  
+  if (list->count <= 16 && !evt->cold_entries) {
+    evt->warned_max_listeners = false;
+    return;
+  }
 
   for (unsigned int i = 0; i < list->count; i++) {
     if (list->types[i] != evt) continue;
@@ -389,19 +393,28 @@ static EventType *evt_list_find_cstr(EventTypeList *list, const char *name, size
   return NULL;
 }
 
-static EventType *evt_list_find(ant_t *js, EventTypeList *list, ant_value_t js_key) {
-  const char *probe = NULL;
+static EventType *evt_list_find_slow(ant_t *js, EventTypeList *list, ant_value_t js_key) {
+  if (vtype(js_key) != kTypeString) return NULL;
+
   size_t probe_len = 0;
-
-  if (vtype(js_key) == kTypeString) probe = js_getstr(js, js_key, &probe_len);
-
-  for (unsigned int i = 0; i < list->count; i++) {
-    EventType *evt = list->types[i];
-    if (evt->js_key == js_key) return evt;
-    if (!probe || !evt->key_bytes || evt->key_len != probe_len) continue;
-    if (memcmp(evt->key_bytes, probe, probe_len) == 0) return evt;
+  const char *probe = js_getstr(js, js_key, &probe_len);
+  EventType *evt = probe ? evt_list_find_cstr(list, probe, probe_len) : NULL;
+  
+  if (evt) {
+    evt->js_key = js_key;
+    evt->key_bytes = probe;
+    emitter_write_barrier(js, list->target, js_key);
   }
-  return NULL;
+  
+  return evt;
+}
+
+static inline __attribute__((always_inline)) EventType *evt_list_find(
+  ant_t *js, EventTypeList *list, ant_value_t js_key
+) {
+  for (unsigned int i = 0; i < list->count; i++)
+    if (list->types[i]->js_key == js_key) return list->types[i];
+  return evt_list_find_slow(js, list, js_key);
 }
 
 static EventType *evt_list_find_or_create(ant_t *js, EventTypeList *list, ant_value_t js_key) {
@@ -424,7 +437,7 @@ static EventType *evt_list_find_or_create(ant_t *js, EventTypeList *list, ant_va
   return evt;
 }
 
-static EventTypeList *find_emitter_events(ant_value_t this_obj) {
+static inline EventTypeList *find_emitter_events(ant_value_t this_obj) {
   return (EventTypeList *)js_get_native(this_obj, EVENT_EMITTER_NATIVE_TAG);
 }
 
@@ -477,7 +490,7 @@ static inline ant_value_t evt_key_from_arg(ant_value_t arg) {
 }
 
 static bool is_eventemitter_instance(ant_value_t target) {
-  return js_check_brand(target, BRAND_EVENTEMITTER);
+  return is_object_type(target) && find_emitter_events(target) != NULL;
 }
 
 static bool is_eventtarget_instance(ant_value_t target) {
@@ -493,7 +506,7 @@ static int eventemitter_get_max_listeners_impl(ant_value_t target) {
   return EVENTS_DEFAULT_MAX_LISTENERS;
 }
 
-static ant_value_t eventemitter_call_listener(
+static inline __attribute__((always_inline)) ant_value_t eventemitter_call_listener_inline(
   ant_t *js,
   ant_value_t listener,
   ant_value_t this_val,
@@ -503,6 +516,30 @@ static ant_value_t eventemitter_call_listener(
   if (!is_callable(listener)) return js_mkundef();
   if (sv_check_c_stack_overflow(js))
     return js_mkerr_typed(js, JS_ERR_RANGE | JS_ERR_NO_STACK, "Maximum call stack size exceeded");
+
+  if (vtype(listener) == kTypeFunction) {
+    sv_closure_t *closure = js_func_closure(listener);
+    
+    if (sv_closure_is_plain_sync(closure)) {
+      sv_call_ctx_t ctx = {
+        .this_val = this_val,
+        .super_val = js_mkundef(),
+        .new_target = js_mkundef(),
+        .args = args,
+        .argc = nargs,
+        .alloc = NULL,
+      };
+      
+      sv_func_t *fn = closure->func;
+      if (fn->jit_code) {
+        ant_value_t result = sv_jit_invoke(js, SV_JIT_FROM_C, fn->jit_code, js->vm, &ctx, closure);
+        if (!sv_is_jit_bailout(result)) return result;
+        sv_jit_on_bailout(fn);
+      }
+      
+      return sv_call_closure_after_jit(js->vm, js, closure, listener, &ctx, NULL);
+    }
+  }
 
   sv_call_plan_t plan;
   ant_value_t err = sv_prepare_call(
@@ -514,25 +551,55 @@ static ant_value_t eventemitter_call_listener(
   return sv_execute_call_plan(js->vm, js, &plan, NULL);
 }
 
+static ant_value_t eventemitter_call_listener(
+  ant_t *js,
+  ant_value_t listener,
+  ant_value_t this_val,
+  ant_value_t *args, int nargs
+) {
+  return eventemitter_call_listener_inline(js, listener, this_val, args, nargs);
+}
+
 static ant_value_t js_eventemitter_once_wrapper(ant_params_t) {
   ant_value_t listener = js_get_slot(js_getcurrentfunc(js), SLOT_DATA);
   if (!is_callable(listener)) return js_mkundef();
   return eventemitter_call_listener(js, listener, js->this_val, args, nargs);
 }
 
-static ant_value_t event_type_get_listeners_array(ant_t *js, EventType *evt, bool raw) {
-  ant_value_t result = js_mkarr(js);
-  if (!evt) return result;
+static ant_value_t entry_once_wrapper(ant_t *js, EventType *evt, EventListenerEntry *entry) {
+  EventListenerCold *cold = entry_ensure_cold(evt, entry);
+  if (!cold) return entry->callback;
+  if (is_callable(cold->raw_callback)) return cold->raw_callback;
 
-  for (unsigned int i = 0; i < utarray_len(evt->listeners); i++) {
+  ant_value_t wrapper = js_heavy_mkfun(js, js_eventemitter_once_wrapper, entry->callback);
+  if (!is_callable(wrapper)) return entry->callback;
+  
+  cold->raw_callback = wrapper;
+  if (evt->owner) emitter_write_barrier(js, evt->owner->target, wrapper);
+  js_set(js, wrapper, "listener", entry->callback);
+  
+  return wrapper;
+}
+
+static ant_value_t event_type_get_listeners_array(ant_t *js, EventType *evt, bool raw) {
+  if (!evt || utarray_len(evt->listeners) == 0) return js_mkarr(js);
+
+  unsigned int len = utarray_len(evt->listeners);
+  if (raw) for (unsigned int i = 0; i < len; i++) {
     EventListenerEntry *entry = (EventListenerEntry *)utarray_eltptr(evt->listeners, i);
-    if (!entry || !entry_live(entry)) continue;
-    
-    js_arr_push(js, result, raw 
-      && entry_once(entry)
-      && is_callable(entry_raw_callback(evt, entry))
-      ? entry_raw_callback(evt, entry) : entry->callback
-    );
+    if (entry_live(entry) && entry_once(entry)) entry_once_wrapper(js, evt, entry);
+  }
+
+  ant_value_t *data = NULL;
+  ant_value_t result = js_mkarr_dense_uninit(js, evt_live_count(evt), &data);
+  if (is_err(result) || !data) return result;
+
+  unsigned int count = 0;
+  for (unsigned int i = 0; i < len; i++) {
+    EventListenerEntry *entry = (EventListenerEntry *)utarray_eltptr(evt->listeners, i);
+    if (!entry_live(entry)) continue;
+    ant_value_t raw_cb = raw && entry_once(entry) ? entry_raw_callback(evt, entry) : js_mkundef();
+    data[count++] = is_callable(raw_cb) ? raw_cb : entry->callback;
   }
 
   return result;
@@ -599,17 +666,12 @@ static ant_value_t js_event_get_isTrusted(ant_params_t) {
 
 static ant_value_t js_eventemitter_ctor(ant_params_t) {
   ant_value_t this_obj = js_getthis(js);
-  
-  if (is_object_type(this_obj)) {
-    js_set_slot(this_obj, SLOT_BRAND, js_mknum(BRAND_EVENTEMITTER));
-    return this_obj;
-  }
+  if (is_object_type(this_obj)) return this_obj;
 
   if (vtype(call_new_target) != kTypeUndefined) {
     ant_value_t obj = js_mkobj(js);
     ant_value_t proto = js_instance_proto_from_new_target(js, js->builtins.eventemitter_proto, call_new_target);
     if (is_object_type(proto)) js_set_proto_init(obj, proto);
-    js_set_slot(obj, SLOT_BRAND, js_mknum(BRAND_EVENTEMITTER));
     return obj;
   }
 
@@ -1010,15 +1072,6 @@ static bool eventemitter_add_listener_impl(
   entry.dead_gen = 0;
   entry.meta = once ? ENTRY_ONCE : 0;
 
-  if (once) {
-    EventListenerCold *cold = entry_ensure_cold(evt, &entry);
-    if (!cold) return false;
-    cold->raw_callback = js_heavy_mkfun(js, js_eventemitter_once_wrapper, listener);
-    if (is_callable(cold->raw_callback))
-      js_set(js, cold->raw_callback, "listener", listener);
-    emitter_write_barrier(js, target, cold->raw_callback);
-  }
-
   if (!prepend || utarray_len(evt->listeners) == 0) utarray_push_back(evt->listeners, &entry);
   else if (evt->emitting > 0) {
     EventListenerCold *cold = entry_ensure_cold(evt, &entry);
@@ -1075,7 +1128,7 @@ static bool eventemitter_remove_listener_impl(
   evt = find_emitter_event_type(js, target, key);
   if (!evt) return false;
 
-  for (unsigned int i = 0; i < utarray_len(evt->listeners); i++) {
+  for (unsigned int i = utarray_len(evt->listeners); i-- > 0;) {
   EventListenerEntry *entry = (EventListenerEntry *)utarray_eltptr(evt->listeners, i);
   if (
     entry_live(entry) &&
@@ -1091,35 +1144,18 @@ static bool eventemitter_remove_listener_impl(
   return false;
 }
 
-static ant_offset_t eventemitter_listener_count_impl(
-  ant_t *js,
-  ant_value_t target, ant_value_t key
-) {
-  EventType *evt = NULL;
-
-  if (!is_object_type(target) || !key) return 0;
-  evt = find_emitter_event_type(js, target, key);
-  if (!evt) return 0;
-
-  return (ant_offset_t)evt_live_count(evt);
-}
-
 static ant_value_t js_eventemitter_off(ant_params_t) {
   if (nargs < 2) return js_mkerr(js, "off requires 2 arguments (event, listener)");
   ant_value_t key = evt_key_from_arg(args[0]);
   
   if (!key) return js_mkerr(js, "event must be a string or Symbol");
   ant_value_t this_obj = js_getthis(js);
-  
-  remove_listener_from(
-    js, args, nargs,
-    find_emitter_event_type(js, this_obj, key)
-  );
+  eventemitter_remove_listener_impl(js, this_obj, key, args[1]);
   
   return this_obj;
 }
 
-static bool eventemitter_dispatch(
+static inline __attribute__((always_inline)) bool eventemitter_dispatch(
   ant_t *js,
   ant_value_t target, EventType *evt,
   ant_value_t *args, int nargs
@@ -1137,37 +1173,31 @@ static bool eventemitter_dispatch(
   for (unsigned int i = 0; i < count; i++) {
     EventListenerEntry *entry = (EventListenerEntry *)utarray_eltptr(evt->listeners, i);
     ant_value_t cb = entry->callback;
-    ant_value_t signal = entry_signal(evt, entry);
 
-    if (entry_consumed(entry)) continue;
-    if (entry->dead_gen != 0 && entry->dead_gen < gen) continue;
-    if (entry_once(entry)) evt_consume(js, evt, i);
+    if (entry->meta != 0 || entry->dead_gen != 0) {
+      if (entry_consumed(entry)) continue;
+      if (entry->dead_gen != 0 && entry->dead_gen < gen) continue;
+      
+      ant_value_t signal = entry_signal(evt, entry);
+      if (entry_once(entry)) evt_consume(js, evt, i);
 
-    if (vtype(signal) != kTypeUndefined && abort_signal_is_aborted(signal)) {
-      evt_retire(js, evt, i);
-      continue;
+      if (vtype(signal) != kTypeUndefined && abort_signal_is_aborted(signal)) {
+        evt_retire(js, evt, i);
+        continue;
+      }
     }
 
     if (vtype(cb) != kTypeFunction && vtype(cb) != kTypeBuiltin) continue;
-    ant_value_t result = eventemitter_call_listener(js, cb, target, args, nargs);
+    ant_value_t result = eventemitter_call_listener_inline(js, cb, target, args, nargs);
     invoked = true;
 
     if (is_err(result) || Ant_Exception_Pending(js)) break;
   }
 
-  evt->emitting--;
-  evt_sweep(evt);
+  if (--evt->emitting == 0 && evt->dead_count == 0 && !evt->needs_reorder) evt->generation = 0;
+  else evt_sweep(evt);
 
   return invoked;
-}
-
-static bool eventemitter_emit_args_impl(
-  ant_t *js,
-  ant_value_t target, ant_value_t key,
-  ant_value_t *args, int nargs
-) {
-  if (!is_object_type(target) || !key) return false;
-  return eventemitter_dispatch(js, target, find_emitter_event_type(js, target, key), args, nargs);
 }
 
 static ant_value_t js_eventemitter_emit(ant_params_t) {
@@ -1176,20 +1206,18 @@ static ant_value_t js_eventemitter_emit(ant_params_t) {
   ant_value_t key = evt_key_from_arg(args[0]);
   if (!key) return js_mkerr(js, "event must be a string or Symbol");
   
-  bool invoked = eventemitter_emit_args_impl(
-    js, js_getthis(js), key,
+  ant_value_t target = js_getthis(js);
+  if (!is_object_type(target)) return js_false;
+  
+  EventTypeList *events = find_emitter_events(target);
+  if (!events) return js_false;
+  
+  bool invoked = eventemitter_dispatch(
+    js, target, evt_list_find(js, events, key),
     nargs > 1 ? &args[1] : NULL, nargs - 1
   );
 
   return Ant_Exception_Pending(js) ? Ant_Exception_Current(js) : js_bool(invoked);
-}
-
-bool eventemitter_emit_args_val(
-  ant_t *js,
-  ant_value_t target, ant_value_t key,
-  ant_value_t *args, int nargs
-) {
-  return eventemitter_emit_args_impl(js, target, key, args, nargs);
 }
 
 bool eventemitter_emit_args(
@@ -1271,13 +1299,6 @@ bool eventemitter_remove_listener(
   }
 
   return false;
-}
-
-ant_offset_t eventemitter_listener_count_val(
-  ant_t *js,
-  ant_value_t target, ant_value_t key
-) {
-  return eventemitter_listener_count_impl(js, target, key);
 }
 
 ant_offset_t eventemitter_listener_count(
@@ -1896,7 +1917,7 @@ static ant_value_t js_events_on(ant_params_t) {
   ant_value_t iter = js_mkobj(js);
   js_set(js, iter, "next", js_heavy_mkfun(js, js_events_on_next, state));
   js_set(js, iter, "return", js_heavy_mkfun(js, js_events_on_return, state));
-  js_set_sym(js, iter, get_asyncIterator_sym(), js_mkfun(js_events_on_self));
+  js_set_sym(js, iter, js->sym.asyncIterator_sym, js_mkfun(js_events_on_self));
   return iter;
 }
 
@@ -1917,7 +1938,7 @@ ant_value_t events_library(ant_t *js) {
   js_set(js, js->builtins.eventemitter_ctor, "setMaxListeners", js_get(js, lib, "setMaxListeners"));
   js_set(js, js->builtins.eventemitter_ctor, "getMaxListeners", js_get(js, lib, "getMaxListeners"));
   js_set(js, js->builtins.eventemitter_ctor, "getEventListeners", js_get(js, lib, "getEventListeners"));
-  js_set_sym(js, lib, get_toStringTag_sym(), js_mkstr(js, "events", 6));
+  js_set_sym(js, lib, js->sym.toStringTag_sym, js_mkstr(js, "events", 6));
   
   return lib;
 }
@@ -1949,7 +1970,7 @@ ant_value_t eventemitter_prototype(ant_t *js) {
   js_set(js, eventemitter_proto, "listeners",          js_mkfun(js_eventemitter_listeners));
   js_set(js, eventemitter_proto, "rawListeners",       js_mkfun(js_eventemitter_rawListeners));
   js_set(js, eventemitter_proto, "eventNames",         js_mkfun(js_eventemitter_eventNames));
-  js_set_sym(js, eventemitter_proto, get_toStringTag_sym(), js_mkstr(js, "EventEmitter", 12));
+  js_set_sym(js, eventemitter_proto, js->sym.toStringTag_sym, js_mkstr(js, "EventEmitter", 12));
 
   js_set_slot(eventemitter_ctor, SLOT_CFUNC, js_mkfun(js_eventemitter_ctor));
   js_mkprop_fast(js, eventemitter_ctor, "prototype", 9, eventemitter_proto);
@@ -1970,7 +1991,7 @@ void init_events_module(ant_t *js) {
   js->builtins.isTrusted_getter = js_mkfun(js_event_get_isTrusted);
   js->builtins.event_proto = js_mkobj(js);
   
-  js_set_sym(js, js->builtins.event_proto, get_toStringTag_sym(), js_mkstr(js, "Event", 5));
+  js_set_sym(js, js->builtins.event_proto, js->sym.toStringTag_sym, js_mkstr(js, "Event", 5));
   js_set(js, js->builtins.event_proto, "preventDefault",          js_mkfun(js_event_preventDefault));
   js_set(js, js->builtins.event_proto, "stopPropagation",         js_mkfun(js_event_stopPropagation));
   js_set(js, js->builtins.event_proto, "stopImmediatePropagation", js_mkfun(js_event_stopImmediatePropagation));
@@ -1990,21 +2011,21 @@ void init_events_module(ant_t *js) {
 
   js->builtins.customevent_proto = js_mkobj(js);
   js_set_proto_init(js->builtins.customevent_proto, js->builtins.event_proto);
-  js_set_sym(js, js->builtins.customevent_proto, get_toStringTag_sym(), js_mkstr(js, "CustomEvent", 11));
+  js_set_sym(js, js->builtins.customevent_proto, js->sym.toStringTag_sym, js_mkstr(js, "CustomEvent", 11));
 
   ant_value_t customevent_fn = js_make_ctor(js, js_customevent_ctor, js->builtins.customevent_proto, "CustomEvent", 11);
   js_set_global_builtin(js, "CustomEvent", customevent_fn);
 
   js->builtins.errorevent_proto = js_mkobj(js);
   js_set_proto_init(js->builtins.errorevent_proto, js->builtins.event_proto);
-  js_set_sym(js, js->builtins.errorevent_proto, get_toStringTag_sym(), js_mkstr(js, "ErrorEvent", 10));
+  js_set_sym(js, js->builtins.errorevent_proto, js->sym.toStringTag_sym, js_mkstr(js, "ErrorEvent", 10));
 
   ant_value_t errorevent_fn = js_make_ctor(js, js_errorevent_ctor, js->builtins.errorevent_proto, "ErrorEvent", 10);
   js_set_global_builtin(js, "ErrorEvent", errorevent_fn);
 
   js->builtins.promiserejectionevent_proto = js_mkobj(js);
   js_set_proto_init(js->builtins.promiserejectionevent_proto, js->builtins.event_proto);
-  js_set_sym(js, js->builtins.promiserejectionevent_proto, get_toStringTag_sym(), js_mkstr(js, "PromiseRejectionEvent", 21));
+  js_set_sym(js, js->builtins.promiserejectionevent_proto, js->sym.toStringTag_sym, js_mkstr(js, "PromiseRejectionEvent", 21));
 
   ant_value_t pre_fn = js_make_ctor(js, js_promiserejectionevent_ctor, js->builtins.promiserejectionevent_proto, "PromiseRejectionEvent", 21);
   js_set_global_builtin(js, "PromiseRejectionEvent", pre_fn);
@@ -2018,7 +2039,7 @@ void init_events_module(ant_t *js) {
   js_set(js, eventtarget_proto, "addEventListener",    js_mkfun(js_add_event_listener_method));
   js_set(js, eventtarget_proto, "removeEventListener", js_mkfun(js_remove_event_listener_method));
   js_set(js, eventtarget_proto, "dispatchEvent",       js_mkfun(js_dispatch_event_method));
-  js_set_sym(js, eventtarget_proto, get_toStringTag_sym(), js_mkstr(js, "EventTarget", 11));
+  js_set_sym(js, eventtarget_proto, js->sym.toStringTag_sym, js_mkstr(js, "EventTarget", 11));
 
   ant_value_t eventtarget_ctor = js_mkobj(js);
   if (is_object_type(function_proto)) js_set_proto_init(eventtarget_ctor, function_proto);
