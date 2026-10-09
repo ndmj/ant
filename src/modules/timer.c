@@ -1026,10 +1026,6 @@ void process_immediates(ant_t *js) {
       process_microtasks(js);
     }
     
-    // Clean up allocated args array if it exists
-    if (entry->args) {
-      free(entry->args);
-    }
     free(entry);
   }
 }
