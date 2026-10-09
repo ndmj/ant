@@ -1121,31 +1121,7 @@ export class ServerResponse extends EventEmitter {
   }
 
   _implicitHeader() {
-    if (this._header) return this._header;
-
-    const statusCode = this.statusCode;
-    const statusMessage = this.statusMessage || 'OK';
-    
-    let headerString = `HTTP/1.1 ${statusCode} ${statusMessage}\r\n`;
-
-    const headers = this._headers || {};
-    const headerNames = this._headerNames || {};
-
-    for (const [key, value] of Object.entries(headers)) {
-      const name = headerNames[key] || key;
-      if (Array.isArray(value)) {
-        for (const v of value) {
-          headerString += `${name}: ${v}\r\n`;
-        }
-      } else {
-        headerString += `${name}: ${value}\r\n`;
-      }
-    }
-
-    headerString += '\r\n';
-    this._header = headerString;
-
-    return this._header;
+    this.writeHead(this.statusCode);
   }
 
   _shouldKeepAlive() {
