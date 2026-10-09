@@ -1136,6 +1136,7 @@ export class ServerResponse extends EventEmitter {
     const head = httpWriter.writeHead(this.statusCode, statusText, this._rawHeaders(), bodyIsStream, bodySize, this._shouldKeepAlive());
 
     this.headersSent = true;
+    this._header = head.toString('latin1');
     this.socket.write(head);
   }
 
